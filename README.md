@@ -63,7 +63,7 @@ versions/26.1-neoforge/libs/
 
 ## 发布
 
-每个版本节点都提供 `publishMods`，可手动发布其自身的产物至 CurseForge 与 Modrinth。两个平台的项目 ID 是所有版本共用的非敏感信息，在根 `gradle.properties` 中取消注释并填写：
+每个版本节点都提供 `publishMods`，可手动发布其自身的产物至 CurseForge 与 Modrinth。两个平台分别发布用 `publishCurseforge` / `publishModrinth`（`publishMods` 要求两个平台的凭据都在，只发一个平台时别用它）。更新日志优先取 `PUBLISH_CHANGELOG` 环境变量，没设就读仓库根的 `CHANGELOG.md`；版本号在 `stonecutter.properties.toml` 的 `mod.version`，改完要重新构建对应节点。两个平台的项目 ID 是所有版本共用的非敏感信息，在根 `gradle.properties` 中取消注释并填写：
 
 ```properties
 publish_curseforge_project_id=你的CurseForge项目ID
