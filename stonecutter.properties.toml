@@ -1,0 +1,61 @@
+# Centralized build parameters. Values moved verbatim from the old
+# root `gradle.properties` (mod.*) and `targets/*/gradle.properties`.
+# See https://stonecutter.kikugie.dev/wiki/config/properties#centralized-properties
+mod.id = "rewind"
+mod.name = "Rewind"
+mod.group = "cc.sighs"
+mod.version = "1.0.1"
+mod.license = "GPL-3.0"
+mod.authors = "MerrySnow"
+mod.description = "Rewrite the past, replay the moment."
+
+deps.fabric_loom = "1.10.5"
+deps.mixin = "0.8.5"
+deps.mixin_gson = "2.10.1"
+deps.mixin_guava = "31.1-jre"
+deps.mixin_asm = "9.7"
+
+["1.20.1"]
+# List of releases to be marked compatible on Modrinth/Curseforge
+mod.mc_releases = ["1.20.1"]
+
+
+[fabric."1.20.1"]
+# Mod compatibility range in fabric.mod.json
+mod.mc_compat = "~1.20.1"
+deps.fabric_loader = "0.16.14"
+deps.fabric_api = "0.92.11+1.20.1"
+deps.aui = "com.sighs:ApricityUI-fabric-1.20.1:1.2.7"
+
+
+[forge."1.20.1"]
+mod.mc_compat = "[1.20.1,)"
+deps.forge_mc = "1.20.1"
+deps.forge = "47.3.0"
+deps.forge_version_range = "[47,)"
+deps.forge_loader_range = "[47,)"
+deps.aui = "com.sighs:ApricityUI-forge-1.20.1:1.2.7"
+
+
+["1.21.1"]
+mod.mc_releases = ["1.21", "1.21.1"]
+
+
+[neoforge."1.21.1"]
+mod.mc_compat = "[1.21, 1.21.1]"
+deps.neo_mc = "1.21.1"
+deps.neo_loader = "21.1.234"
+deps.neo_version_range = "[21.1,)"
+deps.aui = "com.sighs:ApricityUI-neoforge-1.21.1:1.2.7"
+
+
+["26.1"]
+mod.mc_releases = ["26.1"]
+
+
+[neoforge."26.1"]
+mod.mc_compat = "[26.1,)"
+deps.neo_mc = "26.1"
+deps.neo_loader = "26.1.2.84"
+deps.neo_version_range = "[26.1,)"
+deps.aui = "com.sighs:ApricityUI-neoforge-26.1:1.2.7"

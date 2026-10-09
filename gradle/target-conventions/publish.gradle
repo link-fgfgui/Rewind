@@ -1,4 +1,4 @@
-// Applied from an individual target project, not from the aggregate root project.
+// Applied from an individual Stonecutter version project, not from the aggregate root project.
 apply plugin: 'maven-publish'
 
 repositories {
@@ -13,13 +13,12 @@ dependencies {
 
 sourceSets.main.resources.srcDir project(':common').file('src/main/resources')
 
-def publishLoader = project.projectDir.name.tokenize('-').first()
-def publishMinecraftVersion = [
-        forge    : providers.gradleProperty('forge_minecraft_version'),
-        fabric   : providers.gradleProperty('fabric_minecraft_version'),
-        neoforge : providers.gradleProperty('neoforge_121_minecraft_version')
-                .orElse(providers.gradleProperty('neoforge_261_minecraft_version'))
-][publishLoader]
+// Stonecutter version nodes are named `<minecraft-version>-<loader>`
+// (e.g. `1.20.1-fabric`, `26.1-neoforge`), unlike the old
+// `targets/<loader>-<mc>` directories, so the loader is the last token.
+def nodeTokens = project.name.tokenize('-')
+def publishLoader = nodeTokens.last()
+def publishMinecraftVersion = providers.provider { nodeTokens.first() }
 
 // 一个 loader 的生产 jar 由谁产出不一样：Fabric 走 loom 的 remapJar，legacyforge 走 reobfJar
 // （它的 `jar` 是 devlibs 里的 named 映射 jar，发布出去会在生产环境坏掉），NeoForge 直接用 jar。

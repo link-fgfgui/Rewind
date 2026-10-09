@@ -14,10 +14,10 @@
 | 路径 | 默认责任 | 可直接修改 | 额外评审 |
 | --- | --- | --- | --- |
 | `common/` | Core Maintainer | 共享业务逻辑、纯 Java 测试、稳定接口 | 至少一名受影响 target 维护者 |
-| `targets/forge-1.20.1/` | Forge 1.20.1 Maintainer | Forge 入口、事件、资源、Mixin、适配器 | Core Maintainer 仅在 common 合约变化时参与 |
-| `targets/fabric-1.20.1/` | Fabric 1.20.1 Maintainer | Fabric entrypoint、callback、资源、Mixin、适配器 | 同上 |
-| `targets/neoforge-1.21.1/` | NeoForge 1.21.1 Maintainer | NeoForge 入口、事件、资源、Mixin、适配器 | 同上 |
-| `targets/neoforge-26.1/` | NeoForge 26.1 Maintainer | Java 25、26.1 API、资源、渲染和适配器 | 同上 |
+| `versions/1.20.1-forge/` | Forge 1.20.1 Maintainer | Forge 入口、事件、资源、Mixin、适配器 | Core Maintainer 仅在 common 合约变化时参与 |
+| `versions/1.20.1-fabric/` | Fabric 1.20.1 Maintainer | Fabric entrypoint、callback、资源、Mixin、适配器 | 同上 |
+| `versions/1.21.1-neoforge/` | NeoForge 1.21.1 Maintainer | NeoForge 入口、事件、资源、Mixin、适配器 | 同上 |
+| `versions/26.1-neoforge/` | NeoForge 26.1 Maintainer | Java 25、26.1 API、资源、渲染和适配器 | 同上 |
 | 根 Gradle、CI、`docs/` | Build / Release Maintainer | 聚合入口、CI 矩阵、维护文档 | 受影响 target 维护者 |
 
 一个人可以承担多个角色，但评审规则仍按路径执行。实际 GitHub 账号映射写入 `.github/CODEOWNERS`；仓库提供 `.github/CODEOWNERS.example` 作为起点。
@@ -38,16 +38,16 @@
 - 运行时 loader/version 判断、反射分发和某个 target 的资源路径。
 - 为解决单一 target 编译错误而加入的 Minecraft API 抽象泄漏。
 
-### target
+### 版本节点
 
-每个 target 是独立 Gradle 根工程，拥有自己的：
+每个版本节点（`versions/<minecraft-version>-<loader>/`，Stonecutter 在 `settings.gradle.kts` 注册）拥有自己的：
 
 - 入口、注册、事件、网络和生命周期代码。
 - Minecraft API 调用、Mixin、accessor、渲染后端和 client-only 代码。
 - metadata、资源、数据生成和版本范围。
-- JDK、Gradle wrapper、加载器和 mappings 配置。
+- 加载器和 mappings 配置（构建脚本为根 `build.<loader>.gradle.kts`，版本参数在 `stonecutter.properties.toml`；JDK 工具链由构建自动提供）。
 
-不要把 target 专属类以同一全限定名复制到 `common`，也不要依赖 classpath 顺序覆盖 shared class。
+不要把版本专属类以同一全限定名复制到 `common`，也不要依赖 classpath 顺序覆盖 shared class。
 
 ## 变更分类
 
@@ -55,7 +55,7 @@
 
 | 类别 | 典型路径 | 最小评审 | 最小验证 |
 | --- | --- | --- | --- |
-| `target-only` | 一个 `targets/<name>/` | 对应 target 维护者 | 该 target `clean build` 与最小运行验证 |
+| `target-only` | 一个 `versions/<node>/` | 对应版本维护者 | 该节点 `:versions/<node>:build` 与最小运行验证 |
 | `common-internal` | `common/`，无接口变化 | Core Maintainer | common 测试 + 所有引用 common 的已支持 target build |
 | `common-contract` | `common/` 接口、DTO、语义变化 | Core + 每个受影响 target 维护者 | 所有受影响 target build；行为改动应有测试 |
 | `cross-target-feature` | common 加多个 target | Core + 每个改动 target 维护者 | 每个改动 target build；未实现 target 必须明确记录 |
@@ -96,11 +96,10 @@ docs: clarify release matrix
 
 ### target-only 改动
 
-1. 只打开自己的 `targets/<name>/`。
-2. 在该 Gradle 项目中编辑 target 和可见的 `common`。
-3. 如果无需改 `common`，不要触碰其他 target。
-4. 执行 target 自己的 `clean build`。
-5. 在 PR 中说明 Minecraft 版本、加载器、验证 JDK 和实际测试场景。
+1. 只改自己的 `versions/<node>/src`。
+2. 在仓库根目录构建该节点（`./gradlew :versions/<node>:build`），`common` 源码保持可见可编辑。
+3. 如果无需改 `common`，不要触碰其他版本节点。
+4. 在 PR 中说明 Minecraft 版本、加载器和实际测试场景。
 
 ### common 改动
 
@@ -134,7 +133,7 @@ docs: clarify release matrix
 common/render/
   RenderInput, RenderPlan, RenderProfile, SharedRenderLogic
 
-targets/<name>/.../client/
+versions/<node>/.../client/
   RenderBackend, ClientBootstrap, target-specific RenderHooks
 ```
 
@@ -148,18 +147,18 @@ targets/<name>/.../client/
 
 ## 验证矩阵
 
-| Job | 目录 | Gradle JVM | 必须执行 |
+| Job | 目录 | 工具链 | 必须执行 |
 | --- | --- | --- | --- |
-| Forge 1.20.1 | `targets/forge-1.20.1` | JDK 21 | `./gradlew clean build` |
-| Fabric 1.20.1 | `targets/fabric-1.20.1` | JDK 21 | `./gradlew clean build` |
-| NeoForge 1.21.1 | `targets/neoforge-1.21.1` | JDK 21 | `./gradlew clean build` |
-| NeoForge 26.1 | `targets/neoforge-26.1` | JDK 25 | `./gradlew clean build` |
+| Forge 1.20.1 | `versions/1.20.1-forge` | JDK 17 | `./gradlew :versions/1.20.1-forge:build` |
+| Fabric 1.20.1 | `versions/1.20.1-fabric` | JDK 17 | `./gradlew :versions/1.20.1-fabric:build` |
+| NeoForge 1.21.1 | `versions/1.21.1-neoforge` | JDK 21 | `./gradlew :versions/1.21.1-neoforge:build` |
+| NeoForge 26.1 | `versions/26.1-neoforge` | JDK 25 | `./gradlew :versions:26.1-neoforge:build` |
 
 补充规则：
 
-- 根 `-PallTargets=true build` 仅覆盖可由 JDK 21 同时构建的三个 target。它不是 NeoForge 26.1 的验证替代品。
-- 任何改动 `common/` 的 PR，至少触发所有当前支持 target 的 build job。
-- 任何改动一个 target 的资源、Mixin 或 metadata 的 PR，至少检查最终 jar 是否包含对应 metadata、配置文件和 common class。
+- 根 `./gradlew build` 一次构建全部四个版本节点与 `common`，是全矩阵的等价验证。
+- 任何改动 `common/` 的 PR，至少触发所有当前支持版本节点的 build job。
+- 任何改动一个版本节点的资源、Mixin 或 metadata 的 PR，至少检查最终 jar 是否包含对应 metadata、配置文件和 common class。
 - 构建成功不代替运行验证。涉及事件、网络、Mixin、注册、渲染或数据包时，应在 PR 中记录 client、dedicated server、reload 或 data generation 的实际验证范围。
 
 ## Common 自动验证
@@ -168,48 +167,42 @@ targets/<name>/.../client/
 
 ```text
 common/**
-build.gradle, settings.gradle, gradle.properties, gradle/**
-scripts/build-target.ps1
+settings.gradle.kts, stonecutter.gradle.kts, stonecutter.properties.toml,
+build.*.gradle.kts, buildSrc/**, gradle.properties, gradle/**
+versions/**/ci.properties
 .github/workflows/verify-common.yml
 ```
 
 执行顺序：
 
-1. `common-tests` 使用 JDK 21 执行 `common` 的 `clean test`。
-2. 四个 target job 并行执行各自 wrapper 的 `clean build`。`build` 包含 target 和 common 的测试任务。
-3. 每个 target 使用对应 JDK：Forge/Fabric 1.20.1、NeoForge 1.21.1 使用 JDK 21；NeoForge 26.1 使用 JDK 25。
-4. 成功或失败时上传已生成的 `build/libs/*.jar`，便于检查发布物。
-
-`scripts/build-target.ps1` 对 target build 最多重试三次，专门处理首次解析 mappings、NeoForm 或 Maven 时的短暂网络失败。编译错误、测试错误和持续依赖错误仍会使 job 失败。
+1. `common-tests` 执行 `:common:` 的 `test`（JDK 21 运行 Gradle，编译工具链自动提供）。
+2. `version-builds` 执行根 `./gradlew build`，一次构建全部四个 Stonecutter 版本节点（`build` 包含各节点和 common 的测试任务）。
+3. 成功或失败时上传已生成的各版本 `build/libs/*.jar`，便于检查发布物。
 
 建议在仓库分支保护中把以下检查设为合并必需条件：
 
 ```text
 Common Unit Tests
-forge-1.20.1 (JDK 21)
-fabric-1.20.1 (JDK 21)
-neoforge-1.21.1 (JDK 21)
-neoforge-26.1 (JDK 25)
+Version Builds
 ```
 
-target-only 的快速验证工作流可以后续按同一模式增加，但不得替代 common 的全矩阵工作流。
+单版本节点的快速验证工作流可以后续按同一模式增加，但不得替代 common 的全矩阵工作流。
 
 ## PR 评审要求
 
 每个 PR 必须包含：
 
-1. 变更类别与受影响 target。
+1. 变更类别与受影响版本节点。
 2. 是否修改 `common`，以及 common 合约是否变化。
-3. 使用的 JDK、实际执行的构建命令和结果。
+3. 实际执行的构建命令和结果。
 4. 运行时验证说明，或明确说明为何不适用。
-5. 不支持/未验证 target 的影响说明。
+5. 不支持/未验证版本的影响说明。
 
 评审者检查：
 
 - 是否将平台 API 泄漏进 `common`。
-- 是否把 1.20.1、1.21.1、26.1 的资源、Mixin 或客户端代码混入同一 target。
+- 是否把 1.20.1、1.21.1、26.1 的资源、Mixin 或客户端代码混入同一版本节点。
 - 是否更新了所有受影响的桥接实现。
-- 是否因工具链不兼容而错误使用根聚合替代独立构建。
 - 是否新增了重复 class、运行时版本判断或无说明的反射兼容层。
 
 ## 发布流程
@@ -230,25 +223,24 @@ Rewind-neoforge-26.1-<version>.jar
 ### 发布候选
 
 1. 冻结本次发布涉及的 `common` 合约。
-2. 对每个承诺发布的 target 用其要求的 JDK 执行 `clean build`。
+2. 对每个承诺发布的版本节点执行 `./gradlew :versions/<node>:build`。
 3. 检查 jar 名称、metadata、Mixin / access widener、common class 和版本范围。
 4. 在干净的 client 与 dedicated server 环境做最小启动验证。
-5. 发布说明按 target 列出新增、修复、已知限制和不包含的版本。
+5. 发布说明按版本节点列出新增、修复、已知限制和不包含的版本。
 
-版本可以不同步发布。某个 target 未准备好时，不应阻止其他 target 发布，但发布说明必须准确表达覆盖范围。
+版本可以不同步发布。某个版本节点未准备好时，不应阻止其他节点发布，但发布说明必须准确表达覆盖范围。
 
 ## 支持、弃用与新增版本
 
-### 新增 target
+### 新增版本节点
 
 新增版本必须：
 
-1. 新建 `targets/<loader>-<minecraft-version>/`，不在旧 target 添加运行时版本分支。
-2. 提供独立 wrapper、`settings.gradle` 和 `../../common` 源码映射。
-3. 指定责任人、最低 JDK、Gradle 版本、加载器版本和 CI job。
-4. 完成独立构建、client / server 最小验证和最终 jar 检查后，才标记为支持。
+1. 在 `settings.gradle.kts` 注册 Stonecutter 节点（`match(...)`），在 `stonecutter.properties.toml` 加依赖参数，新建 `versions/<minecraft-version>-<loader>/src` 并放入完整源码；不在旧节点添加运行时版本分支。
+2. 指定责任人、最低 JDK、加载器版本和验证命令。
+3. 完成构建、client / server 最小验证和最终 jar 检查后，才标记为支持。
 
-### 弃用 target
+### 弃用版本节点
 
 弃用前应发布最后一个维护版本，并在 README/发布说明写明：
 
@@ -257,13 +249,13 @@ Rewind-neoforge-26.1-<version>.jar
 - 是否只保留构建修复或完全冻结。
 - 迁移目标版本。
 
-弃用 target 不应被删除到无法重现历史发布；先从日常 CI 或支持矩阵移除，再按仓库归档策略处理。
+弃用节点不应被删除到无法重现历史发布；先从日常 CI 或支持矩阵移除，再按仓库归档策略处理。
 
 ## 例外处理
 
 紧急安全修复可以缩短评审，但不能跳过：
 
-- 所有受影响 target 的构建。
+- 所有受影响版本节点的构建。
 - 对 `common` 改动的影响说明。
 - 发布后补充的回归测试或 issue 记录。
 

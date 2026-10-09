@@ -4,25 +4,27 @@ on:
   push:
     paths:
       - 'common/**'
-      - 'build.gradle'
-      - 'settings.gradle'
+      - 'versions/**'
+      - 'settings.gradle.kts'
+      - 'stonecutter.gradle.kts'
+      - 'stonecutter.properties.toml'
+      - 'build.*.gradle.kts'
+      - 'buildSrc/**'
       - 'gradle.properties'
       - 'gradle/**'
-      - 'scripts/build-target.ps1'
-      - 'scripts/discover-targets.ps1'
       - '.github/workflows/verify-common.yml'
-      - 'targets/**/ci.properties'
   pull_request:
     paths:
       - 'common/**'
-      - 'build.gradle'
-      - 'settings.gradle'
+      - 'versions/**'
+      - 'settings.gradle.kts'
+      - 'stonecutter.gradle.kts'
+      - 'stonecutter.properties.toml'
+      - 'build.*.gradle.kts'
+      - 'buildSrc/**'
       - 'gradle.properties'
       - 'gradle/**'
-      - 'scripts/build-target.ps1'
-      - 'scripts/discover-targets.ps1'
       - '.github/workflows/verify-common.yml'
-      - 'targets/**/ci.properties'
   workflow_dispatch:
 
 permissions:
@@ -33,20 +35,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  discover-targets:
-    name: Discover Enabled Targets
-    runs-on: windows-latest
-    outputs:
-      matrix: ${{ steps.discover.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build target matrix
-        id: discover
-        shell: pwsh
-        run: |
-          $matrix = .\scripts\discover-targets.ps1
-          "matrix=$matrix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
   common-tests:
     name: Common Unit Tests
     runs-on: windows-latest
@@ -60,30 +48,29 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Run common unit tests
         shell: pwsh
-        run: .\gradlew.bat -p common clean test --console plain --no-daemon
+        run: .\gradlew.bat :common:test --console plain --no-daemon
 
-  target-builds:
-    name: ${{ matrix.target }} (JDK ${{ matrix.java }})
-    needs: [discover-targets, common-tests]
+  version-builds:
+    name: Version Builds (all Stonecutter nodes)
+    needs: [common-tests]
     runs-on: windows-latest
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.discover-targets.outputs.matrix) }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ matrix.java }}
+          java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build target and run tests
+      - name: Build all versions
         shell: pwsh
-        run: .\scripts\build-target.ps1 -Target ${{ matrix.target }} -Attempts ${{ matrix.attempts }}
+        # Stonecutter builds every versions/<node> plus :common.
+        # JDK 17/21/25 compile toolchains are auto-provisioned.
+        run: .\gradlew.bat build --console plain --no-daemon
       - name: Upload build output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-jdk-${{ matrix.java }}
-          path: targets/${{ matrix.target }}/build/libs/*.jar
+          name: version-jars
+          path: versions/*/build/libs/*.jar
           if-no-files-found: ignore

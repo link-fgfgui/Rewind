@@ -1,17 +1,17 @@
 # Rewind 开发与迁移规范
 
-本仓库使用 `common + targets/<loader>-<minecraft-version>` 结构维护多个 Minecraft 加载器和版本。任何开发者或自动化代理在修改前都必须遵守本文件；更完整的协作、评审和 CI 规则见 [docs/MAINTENANCE_WORKFLOW.md](docs/MAINTENANCE_WORKFLOW.md)。
+本仓库使用 Stonecutter 管理的 `common + versions/<minecraft-version>-<loader>` 结构维护多个 Minecraft 加载器和版本。任何开发者或自动化代理在修改前都必须遵守本文件；更完整的协作、评审和 CI 规则见 [docs/MAINTENANCE_WORKFLOW.md](docs/MAINTENANCE_WORKFLOW.md)。
 
 ## 架构边界
 
 ```text
 common/                         纯 Java 的共享逻辑与共享资源
-targets/<loader>-<mc-version>/  一个独立的加载器 + Minecraft 版本工程
-gradle/target-conventions/      所有 target 共用的构建约定
+versions/<mc-version>-<loader>/  一个加载器 + Minecraft 版本的完整源码（Stonecutter 版本节点）
+gradle/target-conventions/      所有版本共用的构建约定
 ```
 
 - `common` 只放 Java 8 兼容、无 Minecraft/loader 依赖的业务逻辑、DTO、算法、SPI 接口和测试。
-- `targets/*` 只放该 target 的入口、注册、事件、Minecraft API、Mixin、网络、渲染、metadata，以及 SPI 的平台实现。
+- `versions/*` 只放该版本节点的入口、注册、事件、Minecraft API、Mixin、网络、渲染、metadata，以及 SPI 的平台实现。每个节点保留完整源码（从旧 `targets/` 原样搬迁，未做 Stonecutter `//?` 合并），不要在一个节点放多版本分支。
 - 不要在 `common` 引用 `net.minecraft.*`、Forge、NeoForge、Fabric、Mixin 或渲染/网络 API。需要平台能力时，通过 `cc.sighs.rewind.common.spi.RewindPlatform` 暴露，由 target 实现并在模组构造阶段 `RewindPlatforms.install(...)` 装进来。
 - 共享逻辑一律放 common（例如存档点引擎 `cc.sighs.rewind.common.core.CheckpointWriter`、槽位记录 `cc.sighs.rewind.common.store.SnapshotStore`、对外门面 `cc.sighs.rewind.api.RewindApi`）；target 不要复制一份。
 - 不要用运行时版本判断、反射或同名 class 覆盖来兼容不同 target；不同 API 应由各 target 的适配器实现。
@@ -35,20 +35,21 @@ common 需要平台能力时只经 `cc.sighs.rewind.common.spi.RewindPlatform`�
 
 参数里的服务器对象对 common 是不透明的 `Object`，实现方自己转型。`RewindApi` / `CheckpointWriter` / `AutoCheckpoint` 全靠这个接口拿世界根、线程判定、落盘与回滚能力。
 
-新增一个 `(loader, MC 版本)` target 时，除了独立 Gradle 工程与 metadata，还要提供：① 一份 `RewindPlatform` 实现；② `cc.sighs.mixin` 下挂到该版本原版方法上的 Mixin（回滚窗口跳过落盘、区块重建守卫、自动保存挂点）；③ 客户端入口与事件注册、过渡渲染、时间树界面；④ 版本专属资源（mixins 配置、shader、loader metadata）。共享的存档点引擎、槽位格式、索引与时间线逻辑不需要复制。
+新增一个 `(loader, MC 版本)` 节点时，除了在 `settings.gradle.kts` 注册 Stonecutter 版本、往 `stonecutter.properties.toml` 加依赖参数、在 `versions/<mc-version>-<loader>/` 放完整源码与 metadata，还要提供：① 一份 `RewindPlatform` 实现；② `cc.sighs.mixin` 下挂到该版本原版方法上的 Mixin（回滚窗口跳过落盘、区块重建守卫、自动保存挂点）；③ 客户端入口与事件注册、过渡渲染、时间树界面；④ 版本专属资源（mixins 配置、shader、loader metadata）。共享的存档点引擎、槽位格式、索引与时间线逻辑不需要复制。
 
 ## 文件与配置约定
 
 | 内容 | 位置 | 规则 |
 | --- | --- | --- |
 | 共享 Java 代码 | `common/src/main/java/` | 必须保持 Java 8 与无平台依赖。 |
-| 共享资源 | `common/src/main/resources/` | 会自动合并到所有 target 的最终 jar。 |
-| 目标专属资源 | `targets/<name>/src/main/resources/` | 仅放该版本/loader 专属资源。 |
-| Loader metadata | target 的 `src/main/resources/` | 保留在 target；Fabric、Forge、NeoForge 格式不可共用。 |
-| 版本/loader 参数 | `targets/<name>/gradle.properties` | 不放在仓库根 `gradle.properties`。 |
-| 共享模组信息 | 根 `gradle.properties` | 仅 `mod_*` 和 Gradle 运行参数。 |
-| 本地 jar 依赖 | `targets/<name>/libs/` | 自动作为 `implementation` 依赖读取；不需要逐条声明。 |
-| 测试装置 | `targets/<name>/testdata/` | 仅供开发/自测的数据包与夹具；手工拷进 `run/saves/<世界>/datapacks/`，不进发行 jar。 |
+| 共享资源 | `common/src/main/resources/` | 会自动合并到所有版本节点的最终 jar。 |
+| 目标专属资源 | `versions/<node>/src/main/resources/` | 仅放该版本/loader 专属资源。 |
+| Loader metadata | 版本节点的 `src/main/resources/` | 保留在版本节点；Fabric、Forge、NeoForge 格式不可共用。 |
+| 版本/loader 参数 | `stonecutter.properties.toml` | 不放在仓库根 `gradle.properties`（根只留 Gradle 自身选项）。 |
+| 共享模组信息 | `stonecutter.properties.toml` 的 `mod.*` | 版本号、ID、名称、许可证、作者、描述集中管理。 |
+| 版本构建脚本 | 根 `build.<loader>.gradle.kts` | 按 loader 分脚本，由 `settings.gradle.kts` 指派给节点。 |
+| 本地 jar 依赖 | `versions/<node>/libs/` | 自动作为 `implementation` 依赖读取；不需要逐条声明。 |
+| 测试装置 | `versions/<node>/testdata/`（如有） | 仅供开发/自测的数据包与夹具；手工拷进 `run/saves/<世界>/datapacks/`，不进发行 jar。 |
 | 发布配置 | `gradle/target-conventions/publish.gradle` | 统一管理，target 不复制发布逻辑。 |
 
 `libs/` 中的普通 jar 不会自动带来传递依赖；依赖的其他 jar 也必须放入同一个 `libs/`，或改用正常的 Maven 依赖声明。不要把 `*-sources.jar`、`*-javadoc.jar` 或构建产物误放入此目录。
@@ -59,67 +60,71 @@ common 需要平台能力时只经 `cc.sighs.rewind.common.spi.RewindPlatform`�
 
 ## 日常开发
 
-1. 先判断改动是 `common`、单个 target、多个 target，还是构建/发布配置。
-2. 单 target 改动只修改对应 `targets/<name>/`；不因方便而改动其他版本。
-3. 修改 `common` 前先定义不含 Minecraft 类型的语义与接口，再为所有受影响 target 实现桥接。
+1. 先判断改动是 `common`、单个版本节点、多个版本节点，还是构建/发布配置。
+2. 单版本改动只修改对应 `versions/<node>/src`；不因方便而改动其他版本。
+3. 修改 `common` 前先定义不含 Minecraft 类型的语义与接口，再为所有受影响版本节点实现桥接。
 4. 改动资源、metadata、Mixin、注册、事件、网络或渲染时，除构建外必须做相应的运行验证。
-5. 不提交 token、账号、密码、私有仓库凭据、IDE 运行缓存或 `build/` 输出。
+5. Stonecutter 要求 Gradle 守护进程跑在 JDK 21+ 上（settings 插件限制）；编译工具链（17/21/25）由构建自动提供。若本机 `~/.gradle/gradle.properties` 把 `org.gradle.java.home` 钉在旧 JDK，命令行加 `-Dorg.gradle.java.home=<JDK21+路径>` 覆盖，IDEA 里把 Gradle JVM 设为 21+。
+6. 所有用到 ModDevGradle 的构建脚本（`build.forge` / `build.neoforge`）必须用**同一** MDG 版本：同步时各插件都会往**根项目**装 `org.jetbrains.gradle.ext.IdeaExtPlugin`，两个不同 MDG 版本带来两个类加载器各装一次，以 `Cannot add extension with name 'settings'` 炸掉同步。CLI 构建不走这条路，所以只在 IDEA 同步时暴露。
+6. 不提交 token、账号、密码、私有仓库凭据、IDE 运行缓存或 `build/` 输出。
 
 ### 构建命令
 
-每个 target 是独立 Gradle 根工程，应在它自己的目录中构建：
+所有版本由根目录的 Stonecutter 统一构建（`./gradlew build` 一次构建全部四个节点与 `common`）：
 
 ```powershell
-cd targets\forge-1.20.1
-.\gradlew.bat clean build
+.\gradlew.bat :versions:1.20.1-fabric:build
+.\gradlew.bat :versions:1.20.1-forge:build
+.\gradlew.bat :versions:1.21.1-neoforge:build
+.\gradlew.bat :versions:26.1-neoforge:build
+.\gradlew.bat build
 ```
 
-| Target | Gradle JVM |
+| Version 节点 | 编译工具链 |
 | --- | --- |
-| `forge-1.20.1` | JDK 21 |
-| `fabric-1.20.1` | JDK 21 |
-| `neoforge-1.21.1` | JDK 21 |
-| `neoforge-26.1` | JDK 25 |
+| `1.20.1-fabric` | JDK 17 |
+| `1.20.1-forge` | JDK 17 |
+| `1.21.1-neoforge` | JDK 21 |
+| `26.1-neoforge` | JDK 25 |
 
-根项目的 `-PallTargets=true build` 只覆盖前三个 JDK 21 target，不能替代 NeoForge 26.1 的独立构建。
+Stonecutter 的活动版本（`stonecutter.gradle.kts` 中的 `active`，默认 `1.21.1-neoforge`）决定 IDE 里生效的那个节点；`./gradlew build` 不受它影响，永远构建全部节点。
 
-### target 支持状态
+### 版本节点支持状态
 
-四个 target 现在都有完整实现：共享逻辑在 common，各 target 提供平台实现（`RewindPlatform`）、Mixin 与客户端。
+四个版本节点现在都有完整实现：共享逻辑在 common，各节点提供平台实现（`RewindPlatform`）、Mixin 与客户端。
 
-| Target | MC / 加载器 | 客户端 AUI | 原地回滚 | 客户端钩子（NeoForge 事件的替代物） |
+| Version 节点 | MC / 加载器 | 客户端 AUI | 原地回滚 | 客户端钩子（NeoForge 事件的替代物） |
 | --- | --- | --- | --- | --- |
-| `neoforge-1.21.1` | 1.21.1 / NeoForge | 1.2.7 | 有 | NeoForge 原生事件（`RenderFrameEvent` 等） |
-| `neoforge-26.1` | 26.1 / NeoForge | 1.2.7 | 有 | NeoForge 原生事件；`GuiGraphicsExtractor` / `Identifier` / `SavedDataStorage` 等 26.1 改名已消化 |
-| `forge-1.20.1` | 1.20.1 / Forge | 1.2.7 | 有 | `TickEvent.RenderTickEvent` 代替帧 Pre/Post；`MinecraftForge.EVENT_BUS`；mixin 走 jar manifest 的 `MixinConfigs` |
-| `fabric-1.20.1` | 1.20.1 / Fabric | 1.2.7 | 有 | 自写客户端 mixin：帧 Pre/Post 挂 `Minecraft.runTick`、原始按键挂 `KeyboardHandler.keyPress`、拦加载屏挂 `Minecraft.setScreen`；其余走 Fabric API 事件 |
+| `1.21.1-neoforge` | 1.21.1 / NeoForge | 1.2.7 | 有 | NeoForge 原生事件（`RenderFrameEvent` 等） |
+| `26.1-neoforge` | 26.1 / NeoForge | 1.2.7 | 有 | NeoForge 原生事件；`GuiGraphicsExtractor` / `Identifier` / `SavedDataStorage` 等 26.1 改名已消化 |
+| `1.20.1-forge` | 1.20.1 / Forge | 1.2.7 | 有 | `TickEvent.RenderTickEvent` 代替帧 Pre/Post；`MinecraftForge.EVENT_BUS`；mixin 走 jar manifest 的 `MixinConfigs` |
+| `1.20.1-fabric` | 1.20.1 / Fabric | 1.2.7 | 有 | 自写客户端 mixin：帧 Pre/Post 挂 `Minecraft.runTick`、原始按键挂 `KeyboardHandler.keyPress`、拦加载屏挂 `Minecraft.setScreen`；其余走 Fabric API 事件 |
 
-五条已知的跨 target 差异（改代码前先看）：
+五条已知的跨版本差异（改代码前先看）：
 
 - **配置文件**：NeoForge 两个 target 用 `ModConfigSpec`（`run/config/rewind-{common,client}.toml`）；Fabric 没有配置系统，`RewindServerConfig` / `RewindClientConfig` 是手写的 properties 实现（`config/rewind-{common,client}.properties`），**没有「外部改文件自动重载」**，只有界面上的 setter 会立刻落盘。
 - **自动保存间隔**：1.20.1 原版没有 `computeNextAutosaveInterval` / `ticksUntilAutosave`，两个 1.20.1 target 改用 `@ModifyConstant` 替换 `tickServer` 里写死的 `6000`（`require = 0` 软挂点，挂不上只是「间隔设置不生效」）。
 - **AUI 版本**：四个 target 统一 `1.2.7`（坐标分别是 `ApricityUI-{neoforge-1.21.1,neoforge-26.1,forge-1.20.1,fabric-1.20.1}`）。时间树用到的 DOM / 容器 API 在 1.2.4 → 1.2.7 之间保持同构（1.2.4 → 1.2.6 编译期已核），而 1.2.5.2 之前的「flat document 里画不出 `<img>`」的老问题在 1.2.7 上已不存在——四个 target 的时间树封面都应该能画出来（见「曾经的问题」一节）。**metadata 里也声明了这条依赖**（mod id `apricityui`，要求 `>= 1.2.7`）：NeoForge / Forge 各是一段 `[[dependencies.<mod_id>]]`（`side = "CLIENT"`，因为只有客户端的时间树用它），Fabric 写在 `fabric.mod.json` 的 `depends` 里（Fabric 没有分端的依赖声明）。
 - **原地回滚引擎按版本各一份**：四个 target 各有一份 `InPlaceRollback`，依赖的原版内部结构不同（1.20.1 没有 `SimpleRegionStorage` / `generationRefCount`，26.1 的 `ChunkMap` 改继承 `SimpleRegionStorage`、`DimensionDataStorage` 改名 `SavedDataStorage`、`SavedData.save` 消失）。三份新引擎与 1.21.1 那份**步骤顺序与保护条件一致**，差异逐条写在各自的类注释里。
-- **回滚时重建哪些内存状态（被强引用的存档数据）**：四份实现都是「作废没被强引用的条目 + 显式重建被强引用的那几个」，但**强引用清单按版本各不相同，改代码前必须对着该版本的反编译源码核**（`targets/<name>/build/moddev/artifacts/*sources.jar`）：`raids`（`ServerLevel.raids`）、`scoreboard`（`ServerScoreboard` 的脏标记回调）是所有版本都有的；`neoforge_data_attachments`（1.21.1 / 26.1 的等级数据附件，真数据在 `Level` 的附件表上）、`random_sequences`（`ServerLevel.randomSequences`，1.20.1 起就有）多数版本有；`forge-1.20.1` 多一个 Forge 的 `capabilities`（`LevelCapabilityData` + `ServerLevel.initCapabilities()`，fabric 没有对应物）；`neoforge-26.1` 把一大批东西改成了字段持有（`chunk_tickets`、`world_gen_settings`、`game_rules`、`world_clocks`、`scheduled_events`、`stopwatches`、`custom_boss_events`、`ender_dragon_fight`、`wandering_trader`），这些**只能保住落盘、内容不回滚**。另外 `command_storage_*`（按命名空间拼的那个）在 **1.20.1 / 1.21.1 不在**保护名单里：`CommandStorage.get` 走存储层，清掉缓存条目后会重新读盘重建 `Container`，内容跟着回滚、也继续正常落盘（`CommandStorage.get` 在 1.20.1 是 `storage.get(...)`）。但 **26.1 必须保护**：那边 `CommandStorage.get` 命中内存里 `namespaces` 那份 Container 就直接返回、不走存储层，清掉缓存既回滚不了内容，还会让那份 Container 掉出存储缓存、以后再也写不进文件。判定手法：`grep -rl "extends SavedData"` 找全部子类，再 `grep -rnE "=\s*[^;]*computeIfAbsent\("` 看赋值是进字段还是就地返回。
+- **回滚时重建哪些内存状态（被强引用的存档数据）**：四份实现都是「作废没被强引用的条目 + 显式重建被强引用的那几个」，但**强引用清单按版本各不相同，改代码前必须对着该版本的反编译源码核**（`versions/<node>/build/moddev/artifacts/*sources.jar`）：`raids`（`ServerLevel.raids`）、`scoreboard`（`ServerScoreboard` 的脏标记回调）是所有版本都有的；`neoforge_data_attachments`（1.21.1 / 26.1 的等级数据附件，真数据在 `Level` 的附件表上）、`random_sequences`（`ServerLevel.randomSequences`，1.20.1 起就有）多数版本有；`forge-1.20.1` 多一个 Forge 的 `capabilities`（`LevelCapabilityData` + `ServerLevel.initCapabilities()`，fabric 没有对应物）；`neoforge-26.1` 把一大批东西改成了字段持有（`chunk_tickets`、`world_gen_settings`、`game_rules`、`world_clocks`、`scheduled_events`、`stopwatches`、`custom_boss_events`、`ender_dragon_fight`、`wandering_trader`），这些**只能保住落盘、内容不回滚**。另外 `command_storage_*`（按命名空间拼的那个）在 **1.20.1 / 1.21.1 不在**保护名单里：`CommandStorage.get` 走存储层，清掉缓存条目后会重新读盘重建 `Container`，内容跟着回滚、也继续正常落盘（`CommandStorage.get` 在 1.20.1 是 `storage.get(...)`）。但 **26.1 必须保护**：那边 `CommandStorage.get` 命中内存里 `namespaces` 那份 Container 就直接返回、不走存储层，清掉缓存既回滚不了内容，还会让那份 Container 掉出存储缓存、以后再也写不进文件。判定手法：`grep -rl "extends SavedData"` 找全部子类，再 `grep -rnE "=\s*[^;]*computeIfAbsent\("` 看赋值是进字段还是就地返回。
 
 ### 手动跑客户端 / 专用服务器
 
 ```powershell
-cd targets\neoforge-1.21.1
-.\gradlew.bat runClient
-.\gradlew.bat runServer      # server run 自带 --nogui
+.\gradlew.bat :versions:1.21.1-neoforge:runClient
+.\gradlew.bat :versions:1.21.1-neoforge:runServer
 ```
 
 **仓库里已经没有「自动跑游戏」的自测机制了**：`-PrwQuickPlay` / `-PrwSelfTest` 两个运行参数、
-`RewindSelfTest` / `RewindServerSelfTest` 两个类、以及各 target 的 `testdata/` 都已删除。
-要验行为就手动起客户端（F7 存档 / F8 回溯 / F9 时间树），看 `run/logs/latest.log`。
+`RewindSelfTest` / `RewindServerSelfTest` 两个类都已删除。
+要验行为就手动起客户端（F7 存档 / F8 回溯 / F9 时间树），看对应版本 `run/logs/latest.log`。
 
 ### 跑起来之后踩过的坑（各 target）
 
 这些坑都是真起过游戏之后才暴露的，改这些地方前先看：
 
 - **fabric 的 loom run 配置是 `programArgs`，不是 `programArgument`**（后者是 ModDevGradle 的 DSL）。写错不会让 `build` 失败，只会在 `runClient` / `runServer` 时直接 `BUILD FAILED in 1s`。
-- **AUI fabric 的 SPI provider 是坏的**：`FabricAnnotationScanner` 只有 private 无参构造器，AUI 却用 `ServiceLoader.findFirst()` 取它 → `NoSuchMethodException`，客户端与专用服务器都起不来。`targets/fabric-1.20.1` 用 `cc.sighs.mixin.AuiFabricAnnotationScanMixins` 把那处调用重定向成反射构造绕开；AUI 上游修好后可删。neoforge / forge 的同名 provider 都是 public，不受影响。
+- **AUI fabric 的 SPI provider 是坏的**：`FabricAnnotationScanner` 只有 private 无参构造器，AUI 却用 `ServiceLoader.findFirst()` 取它 → `NoSuchMethodException`，客户端与专用服务器都起不来。`versions/1.20.1-fabric` 用 `cc.sighs.mixin.AuiFabricAnnotationScanMixins` 把那处调用重定向成反射构造绕开；AUI 上游修好后可删。neoforge / forge 的同名 provider 都是 public，不受影响。
 - **forge 的 mod 依赖必须用 `modImplementation`**，不能是 `implementation`：1.20.1 Forge 的发行 jar 是 SRG、dev 是 named，`implementation` 不做 remap → 既有 `NoSuchMethodError: MenuScreens.m_96206_` 这类崩溃，也会让 `RewindTreeScreen` 里覆盖 `ApricityScreen` 的方法**一个都不生效**。
 - **forge 需要 `pack.mcmeta`**（`pack_format` = 15）：没有它 Forge 会弹 `LoadingErrorScreen`（`failed to load a valid ResourcePackInfo`）并跳过 `setInitialScreen`，quickPlay 永远进不了世界。
 - **1.20.1 的着色器名字**：`ShaderInstance(ResourceProvider, String, VertexFormat)` 把名字拼成 `shaders/core/<name>.json` 且固定去 `minecraft` 命名空间找，传 `rewind:rewind_transition` 会直接抛 `ResourceLocationException`。1.20.1 的 `RewindTransitionRenderer` 传裸名 + 一个重定向到 `rewind` 命名空间的 `ResourceProvider`，json 里的 `vertex` / `fragment` 也是裸名。
@@ -131,7 +136,7 @@ cd targets\neoforge-1.21.1
 
 改 target 构建时容易踩的两个坑，只在 dev 运行下暴露：
 
-- **common 的类进不了 MOD_CLASSES**：ModDevGradle 只把 `neoForge { mods { ... } }` 里声明的 sourceSet 输出交给 FML，`implementation project(':common')` 不会进入游戏真正使用的 legacy classpath。使用 legacy classpath 的 target 需要额外声明 `additionalRuntimeClasspath project(':common')`（见 `targets/neoforge-1.21.1/build.gradle`），否则 dev 下会 `NoClassDefFoundError`。**NeoForge 26.1 起 ModDevGradle 已经取消这条 classpath**（`VersionCapabilities.legacyClasspath()` 为 false，声明它会直接报 `there is no additional classpath anymore for Minecraft 26.1.2`）；那边 dev 运行直接用标准 `runtimeClasspath`，`implementation project(':common')` 就够了。
+- **common 的类进不了 MOD_CLASSES**：ModDevGradle 只把 `neoForge { mods { ... } }` 里声明的 sourceSet 输出交给 FML，`implementation project(':common')` 不会进入游戏真正使用的 legacy classpath。使用 legacy classpath 的版本节点需要额外声明 `additionalRuntimeClasspath project(':common')`（见根 `build.neoforge.gradle.kts` 里按 `1.21.1` 条件挂的那一句），否则 dev 下会 `NoClassDefFoundError`。**NeoForge 26.1 起 ModDevGradle 已经取消这条 classpath**（`VersionCapabilities.legacyClasspath()` 为 false，声明它会直接报 `there is no additional classpath anymore for Minecraft 26.1.2`）；那边 dev 运行直接用标准 `runtimeClasspath`，`implementation project(':common')` 就够了。
 - **包名不能与 target 重叠**：dev 下 common 的 jar 是独立自动模块，若它的包与 target 模组模块的包同名（例如都在 `cc.sighs`），ModLauncher 会以 `ResolutionException: Modules ... export package ...` 启动失败。
 
 ### 存档 / 读档 API
@@ -230,7 +235,7 @@ F8 回溯分三步：关世界 → 用快照覆盖存档文件 → 重新开世�
 
 F8 默认走**原地回滚**（`cc.sighs.rewind.server.InPlaceRollback`）：世界不关、客户端不重登，在活着的集成服务器里把世界倒回存档点。整段跑在服务端线程上，客户端只轮询 `CheckpointController` 的几个标记（`Phase.ROLLING_BACK`）。失败会自动退回上面那条「关世界 → 覆盖 → 重开」的老路。
 
-`neoforge-26.1` 也接了同一份引擎：`NeoForge261RewindPlatform.supportsInPlaceRollback()` 返回 true，`rollbackInPlace` 走 26.1 版的 `InPlaceRollback`。步骤顺序、保护条件、`Result` 口径与 1.21.1 完全一致，换掉的只是原版内部入口——`DimensionDataStorage` → `SavedDataStorage`（缓存键变成 `SavedDataType<?>`）、`Raids.getFileId()/factory()` → `Raids.TYPE`、记分板改走 `ServerScoreboard.load(Packed)`、`player.load(CompoundTag)` → `player.load(ValueInput)`（维度读 `ServerPlayer.SavedPosition`）、天气从 level.dat 挪进服务器级 `WeatherData` SavedData、时间字段 `GameTime/DayTime` 变成单个 `Time`、出生点变成 `LevelData.RespawnData`。存档数据一律「作废缓存 → 从已被快照覆盖的磁盘重新读」，所以不硬编码 `data/*.dat` 的路径（26.1 的 SavedData 落盘是 `<dataFolder>/<namespace>/<path>.dat`）。逐条对照写在 `targets/neoforge-26.1/.../InPlaceRollback.java` 与 `RollbackAccessMixins.java` 的类注释里。
+`neoforge-26.1` 也接了同一份引擎：`NeoForge261RewindPlatform.supportsInPlaceRollback()` 返回 true，`rollbackInPlace` 走 26.1 版的 `InPlaceRollback`。步骤顺序、保护条件、`Result` 口径与 1.21.1 完全一致，换掉的只是原版内部入口——`DimensionDataStorage` → `SavedDataStorage`（缓存键变成 `SavedDataType<?>`）、`Raids.getFileId()/factory()` → `Raids.TYPE`、记分板改走 `ServerScoreboard.load(Packed)`、`player.load(CompoundTag)` → `player.load(ValueInput)`（维度读 `ServerPlayer.SavedPosition`）、天气从 level.dat 挪进服务器级 `WeatherData` SavedData、时间字段 `GameTime/DayTime` 变成单个 `Time`、出生点变成 `LevelData.RespawnData`。存档数据一律「作废缓存 → 从已被快照覆盖的磁盘重新读」，所以不硬编码 `data/*.dat` 的路径（26.1 的 SavedData 落盘是 `<dataFolder>/<namespace>/<path>.dat`）。逐条对照写在 `versions/26.1-neoforge/src/main/java/cc/sighs/rewind/server/InPlaceRollback.java` 与 `RollbackAccessMixins.java` 的类注释里。
 
 顺序（每一步都有非它不可的理由，改之前先读 `InPlaceRollback` 的类注释）：
 
@@ -373,7 +378,7 @@ F9 / `/rewind ui` 打开 `RewindTreeScreen`——「时间树」，一页管所�
 
 ### 发布
 
-在对应 target 内运行 `publishMods` 可手动发布该 target 的 jar 到 CurseForge 和 Modrinth。根 `gradle.properties` 中配置非敏感项目 ID；token 只通过环境变量提供：
+用版本节点的 `publishMods` 任务手动发布该节点的 jar 到 CurseForge 和 Modrinth（例如 `.\gradlew.bat :versions:1.20.1-forge:publishMods`）。根 `gradle.properties` 中配置非敏感项目 ID；token 只通过环境变量提供：
 
 ```powershell
 $env:CURSEFORGE_TOKEN = '...'
@@ -381,28 +386,27 @@ $env:MODRINTH_TOKEN = '...'
 .\gradlew.bat publishMods
 ```
 
-发布前必须执行该 target 的 `clean build`，检查 jar 内的 metadata、共享 class、共享资源和版本范围。不要从根项目或错误 target 发布。
+发布前必须执行该节点的 `build`，检查 jar 内的 metadata、共享 class、共享资源和版本范围。不要发布错误节点的产物。
 
-## 将既有项目迁入本框架
+## 新增版本节点
 
-迁移应以“先可构建、再抽取共享代码、最后验证行为”为顺序，禁止先删除旧工程再尝试恢复。
+本仓库已完成 Stonecutter 迁移：四个版本节点各保留完整源码（`versions/<mc-version>-<loader>/src`），未做 `//?` 条件合并。新增 `(loader, Minecraft 版本)` 时按以下顺序，禁止先删除旧源码再尝试恢复。
 
-1. **盘点原项目**：记录 Minecraft 版本、loader、JDK、Gradle、mappings、入口、Mixin、资源、数据生成、依赖与运行配置。
-2. **建立 target**：为每个 `(loader, Minecraft 版本)` 建立 `targets/<loader>-<mc-version>/` 独立工程，包含 wrapper、`settings.gradle`、本地 `gradle.properties` 与 `../../common` 映射。
-3. **复制专属层**：将入口、注册、事件、Mixin、渲染、网络、metadata 和版本专属资源放入对应 target；不要在一个 target 放多版本分支。
+1. **盘点版本差异**：记录 Minecraft 版本、loader、JDK、mappings、入口、Mixin、资源、依赖与运行配置；先对照 `docs/version-differences/` 看 API 变化点。
+2. **注册节点**：在 `settings.gradle.kts` 的 `match(...)` 里加一行，在 `stonecutter.properties.toml` 里加对应 `[loader."mc"]` 依赖参数。
+3. **复制专属层**：把最接近的现存节点 `src` 整体复制为新节点起点，再按版本差异改；不要在一个节点放多版本分支。
 4. **抽取 common**：仅将不使用平台类型的状态、规则、计算、DTO 和接口迁到 `common`。把 Minecraft 对象转换为 primitive、字符串、UUID 或自定义 DTO 后再跨边界传递。
-5. **迁移资源**：所有 target 共用的 assets/data/lang 放到 `common/src/main/resources/`；将 Fabric/Forge/NeoForge metadata 与版本专属 Mixin 配置保留在 target。
-6. **迁移依赖**：可从公开仓库解析的依赖写入对应 target 的 `build.gradle`；仅本地提供的 jar 放入该 target 的 `libs/`。不要把 loader 依赖放入 `common`。
-7. **迁移配置**：模组名称、ID、许可证、作者、描述等共享值放根 `gradle.properties`；Minecraft、loader、mappings、版本范围和 JDK 相关值放 target 本地属性。
-8. **逐 target 验证**：使用要求的 JDK 运行 `clean build`，检查 jar 内容，并做最小 client 与 dedicated server 启动验证；涉及数据或资源时额外运行 data generation/reload 验证。
-9. **记录差异**：不能立即统一的 API 或行为差异写入 `docs/version-differences/`，由 target 适配实现，不能以 common 中的版本判断掩盖。
-10. **清理旧结构**：只有所有迁入 target 均可构建且已验证后，才删除旧代码、旧资源与旧构建入口。
+5. **迁移资源**：所有版本共用的 assets/data/lang 放到 `common/src/main/resources/`；将 Fabric/Forge/NeoForge metadata 与版本专属 Mixin 配置保留在版本节点。
+6. **迁移依赖**：可从公开仓库解析的依赖写入 `stonecutter.properties.toml` 对应小节（构建脚本里引用）；仅本地提供的 jar 放入该节点的 `libs/`。不要把 loader 依赖放入 `common`。
+7. **迁移配置**：模组名称、ID、许可证、作者、描述等共享值放 `stonecutter.properties.toml` 的 `mod.*`；Minecraft、loader、版本范围放版本小节。
+8. **逐节点验证**：运行 `./gradlew :versions/<node>:build`，检查 jar 内容，并做最小 client 与 dedicated server 启动验证；涉及数据或资源时额外运行 data generation/reload 验证。
+9. **记录差异**：不能立即统一的 API 或行为差异写入 `docs/version-differences/`，由版本节点适配实现，不能以 common 中的版本判断掩盖。
 
 ## 提交前检查
 
-- `common` 不含平台 import，且所有受影响 target 均已适配。
-- 每个新增/修改的 target 使用正确 JDK 独立构建。
-- 最终 jar 含正确 metadata、目标专属资源与共享 class/resources。
-- 本地 `libs/` 内容明确且没有误提交的旧 jar。
+- `common` 不含平台 import，且所有受影响版本节点均已适配。
+- 每个新增/修改的版本节点用 `./gradlew :versions/<node>:build` 构建通过。
+- 最终 jar 含正确 metadata、版本专属资源与共享 class/resources。
+- 版本 `libs/` 内容明确且没有误提交的旧 jar。
 - 发布相关改动不包含 token；项目 ID、版本类型、依赖关系和 changelog 已确认。
-- README、版本差异文档和支持矩阵与实际 target 一致。
+- README、版本差异文档和支持矩阵与实际版本节点一致。
