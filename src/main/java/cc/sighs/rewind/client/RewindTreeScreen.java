@@ -13,7 +13,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+//? if fabric {
+/*import org.jetbrains.annotations.Nullable;
+*///?} else {
 import javax.annotation.Nullable;
+//?}
 import cc.sighs.rewind.Rewind;
 import cc.sighs.rewind.api.RewindApi;
 import cc.sighs.rewind.api.RewindResult;
@@ -69,6 +73,9 @@ import org.lwjgl.glfw.GLFW;
  * </ul>
  *
  * <p>两套布局共用同一个「选中槽位」，切过去切回来选的还是那一个；右侧详情面板始终跟着它。
+ *
+ * <p>四版本共用这一份（本体只用两边同形的原版 API 加 AUI API，没有框架事件）。
+ * 唯一的版本配件是「改键」打开的那一页（见 {@link RewindKeyBindsScreen}）与群系键的取值。
  */
 public final class RewindTreeScreen extends ApricityScreen {
     /** 模板路径，相对 AUI 的 {@code assets/apricityui/apricity/} 基准目录。 */
@@ -951,7 +958,11 @@ public final class RewindTreeScreen extends ApricityScreen {
         BlockPos position = player.blockPosition();
         String biome = minecraft.level.getBiome(position)
                 .unwrapKey()
+                //? if >=26.1 {
+                /*.map(key -> biomeName(key.identifier().toString()))
+                *///?} else {
                 .map(key -> biomeName(key.location().toString()))
+                //?}
                 .orElseGet(() -> tr("rewind.ui.biome.unknown"));
         StringBuilder html = new StringBuilder();
         html.append(chip("rewind.ui.hud.biome", biome));
@@ -1134,7 +1145,11 @@ public final class RewindTreeScreen extends ApricityScreen {
             BlockPos position = player.blockPosition();
             String biome = minecraft.level.getBiome(position)
                     .unwrapKey()
+                    //? if >=26.1 {
+                    /*.map(key -> biomeName(key.identifier().toString()))
+                    *///?} else {
                     .map(key -> biomeName(key.location().toString()))
+                    //?}
                     .orElseGet(() -> tr("rewind.ui.biome.unknown"));
             html.append(text(biome)).append("<span>·</span>")
                     .append(text(position.getX() + ", " + position.getY() + ", " + position.getZ()));

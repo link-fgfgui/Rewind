@@ -97,7 +97,7 @@ docs: clarify release matrix
 ### target-only 改动
 
 1. 只改自己的 `versions/<node>/src`。
-2. 在仓库根目录构建该节点（`./gradlew :versions/<node>:build`），`common` 源码保持可见可编辑。
+2. 在仓库根目录构建该节点（`./gradlew :<node>:build`），`common` 源码保持可见可编辑。
 3. 如果无需改 `common`，不要触碰其他版本节点。
 4. 在 PR 中说明 Minecraft 版本、加载器和实际测试场景。
 
@@ -149,10 +149,10 @@ versions/<node>/.../client/
 
 | Job | 目录 | 工具链 | 必须执行 |
 | --- | --- | --- | --- |
-| Forge 1.20.1 | `versions/1.20.1-forge` | JDK 17 | `./gradlew :versions/1.20.1-forge:build` |
-| Fabric 1.20.1 | `versions/1.20.1-fabric` | JDK 17 | `./gradlew :versions/1.20.1-fabric:build` |
-| NeoForge 1.21.1 | `versions/1.21.1-neoforge` | JDK 21 | `./gradlew :versions/1.21.1-neoforge:build` |
-| NeoForge 26.1 | `versions/26.1-neoforge` | JDK 25 | `./gradlew :versions:26.1-neoforge:build` |
+| Forge 1.20.1 | `versions/1.20.1-forge` | JDK 17 | `./gradlew :1.20.1-forge:build` |
+| Fabric 1.20.1 | `versions/1.20.1-fabric` | JDK 17 | `./gradlew :1.20.1-fabric:build` |
+| NeoForge 1.21.1 | `versions/1.21.1-neoforge` | JDK 21 | `./gradlew :1.21.1-neoforge:build` |
+| NeoForge 26.1 | `versions/26.1-neoforge` | JDK 25 | `./gradlew :26.1-neoforge:build` |
 
 补充规则：
 
@@ -223,7 +223,7 @@ Rewind-neoforge-26.1-<version>.jar
 ### 发布候选
 
 1. 冻结本次发布涉及的 `common` 合约。
-2. 对每个承诺发布的版本节点执行 `./gradlew :versions/<node>:build`。
+2. 对每个承诺发布的版本节点执行 `./gradlew :<node>:build`。
 3. 检查 jar 名称、metadata、Mixin / access widener、common class 和版本范围。
 4. 在干净的 client 与 dedicated server 环境做最小启动验证。
 5. 发布说明按版本节点列出新增、修复、已知限制和不包含的版本。

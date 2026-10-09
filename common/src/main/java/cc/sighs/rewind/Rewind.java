@@ -7,11 +7,11 @@ import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.snapshot.SnapshotLayout;
 
 /**
- * 本 target 的共用常量与全局状态门面。
+ * 各版本共用的常量与全局状态门面（四节点逐字节相同，故只在 common 留一份）。
  *
  * <p>真正的实现都在 common：日志走 {@link RewindLog}，回滚窗口与区块重建名单在 {@link RewindState}，
- * 槽位常量在 {@link SnapshotLayout}。这里只保留一个 target 侧的短名字，免得几十处调用点都写全限定名；
- * 它没有任何自己的状态，也就不会出现「不同 target 各有一份」的问题。
+ * 槽位常量在 {@link SnapshotLayout}。这里只保留一个短名字，免得几十处调用点都写全限定名；
+ * 它没有任何自己的状态，也就不会出现「不同版本各有一份」的问题。
  */
 public final class Rewind {
     public static final String MOD_ID = RewindCommon.MOD_ID;

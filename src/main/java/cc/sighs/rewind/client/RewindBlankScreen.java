@@ -1,6 +1,10 @@
 package cc.sighs.rewind.client;
 
+//? if >=26.1 {
+/*import net.minecraft.client.gui.GuiGraphicsExtractor;
+*///?} else {
 import net.minecraft.client.gui.GuiGraphics;
+//?}
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
@@ -16,9 +20,9 @@ import net.minecraft.network.chat.Component;
  * （{@code isPauseScreen()} 返回 false），画面完全交给
  * {@link RewindTransitionRenderer} 的后处理效果。世界一回来就把它摘掉。
  *
- * <p>与 NeoForge 1.21.1 那份的差别只在重写签名：1.20.1 的
- * {@code Screen#renderBackground} 只有一个 {@code GuiGraphics} 参数（1.21.1 是四个），
- * 而 {@code render} 本身就是四个参数，两边一致。
+ * <p>重写签名按版本走：1.20.1 的 {@code renderBackground} 只有一个 {@code GuiGraphics} 参数
+ * （1.21.1 起四个）；26.1 改渲染管线，两个方法分别叫 {@code extractRenderState} /
+ * {@code extractBackground}，图形参数是 {@code GuiGraphicsExtractor}。
  */
 public class RewindBlankScreen extends Screen {
     public RewindBlankScreen() {
@@ -30,15 +34,34 @@ public class RewindBlankScreen extends Screen {
         // 不需要任何控件
     }
 
+    //? if >=26.1 {
+    /*@Override
+    public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
+        // 什么都不画：过渡画面由后处理负责
+    }
+    *///?} else {
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         // 什么都不画：过渡画面由后处理负责
     }
+    //?}
 
-    @Override
+    //? if <1.21 {
+    /*@Override
     public void renderBackground(GuiGraphics graphics) {
         // 也压掉原版的背景（没有世界时它会把全景图铺上来）
     }
+    *///?} elif >=26.1 {
+    /*@Override
+    public void extractBackground(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
+        // 也压掉原版的背景（没有世界时它会把全景图铺上来）
+    }
+    *///?} else {
+    @Override
+    public void renderBackground(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+        // 也压掉原版的背景（没有世界时它会把全景图铺上来）
+    }
+    //?}
 
     @Override
     public boolean isPauseScreen() {

@@ -11,12 +11,13 @@ gradle/target-conventions/      所有版本共用的构建约定
 ```
 
 - `common` 只放 Java 8 兼容、无 Minecraft/loader 依赖的业务逻辑、DTO、算法、SPI 接口和测试。
-- `versions/*` 只放该版本节点的入口、注册、事件、Minecraft API、Mixin、网络、渲染、metadata，以及 SPI 的平台实现。每个节点保留完整源码（从旧 `targets/` 原样搬迁，未做 Stonecutter `//?` 合并），不要在一个节点放多版本分支。
+- `versions/*` 只放该版本节点的入口、注册、事件、Minecraft API、Mixin、网络、渲染、metadata，以及 SPI 的平台实现（小差异文件除外——见下）。不要在一个节点放多版本分支。
+- 根 `src/` 只放四版本可 `//?` 合并的小差异文件（提交态保持活动版本视角：恰一个分支 live，其余用 `/* */` 包住；手写并集态提交会导致活动版本编译失败，要跑 `:1.21.1-neoforge:stonecutterMerge` 规范化）。中大差异（不同框架/事件体系/渲染管线）不硬合，继续各留一份。
 - 不要在 `common` 引用 `net.minecraft.*`、Forge、NeoForge、Fabric、Mixin 或渲染/网络 API。需要平台能力时，通过 `cc.sighs.rewind.common.spi.RewindPlatform` 暴露，由 target 实现并在模组构造阶段 `RewindPlatforms.install(...)` 装进来。
 - 共享逻辑一律放 common（例如存档点引擎 `cc.sighs.rewind.common.core.CheckpointWriter`、槽位记录 `cc.sighs.rewind.common.store.SnapshotStore`、对外门面 `cc.sighs.rewind.api.RewindApi`）；target 不要复制一份。
 - 不要用运行时版本判断、反射或同名 class 覆盖来兼容不同 target；不同 API 应由各 target 的适配器实现。
 - 一个发布 jar 只对应一个 loader 与一个 Minecraft 版本，禁止 universal jar。
-- `cc.sighs.rewind.api`、`cc.sighs.rewind.snapshot`、`cc.sighs.rewind.common.*` 三个包整体归 common，target 里不要再出现同名包——dev 下 common 的 jar 是独立自动模块，两边导出同一个包会以 `ResolutionException: Modules ... export package ...` 启动失败。
+- `cc.sighs.rewind`（`Rewind` 门面，四节点逐字节相同故只在 common 留一份）、`cc.sighs.rewind.api`、`cc.sighs.rewind.snapshot`、`cc.sighs.rewind.common.*` 整体归 common，版本节点里不要再出现同名包——dev 下 common 的 jar 是独立自动模块，两边导出同一个包会以 `ResolutionException: Modules ... export package ...` 启动失败。
 
 ### SPI 边界
 
@@ -61,22 +62,23 @@ common 需要平台能力时只经 `cc.sighs.rewind.common.spi.RewindPlatform`�
 ## 日常开发
 
 1. 先判断改动是 `common`、单个版本节点、多个版本节点，还是构建/发布配置。
-2. 单版本改动只修改对应 `versions/<node>/src`；不因方便而改动其他版本。
+2. 单版本改动只修改对应 `versions/<node>/src`；不因方便而改动其他版本。四版本共用的小差异文件在根 `src/`（改完跑全量 `build`，四个节点的生成与编译都得过）。
 3. 修改 `common` 前先定义不含 Minecraft 类型的语义与接口，再为所有受影响版本节点实现桥接。
 4. 改动资源、metadata、Mixin、注册、事件、网络或渲染时，除构建外必须做相应的运行验证。
 5. Stonecutter 要求 Gradle 守护进程跑在 JDK 21+ 上（settings 插件限制）；编译工具链（17/21/25）由构建自动提供。若本机 `~/.gradle/gradle.properties` 把 `org.gradle.java.home` 钉在旧 JDK，命令行加 `-Dorg.gradle.java.home=<JDK21+路径>` 覆盖，IDEA 里把 Gradle JVM 设为 21+。
 6. 所有用到 ModDevGradle 的构建脚本（`build.forge` / `build.neoforge`）必须用**同一** MDG 版本：同步时各插件都会往**根项目**装 `org.jetbrains.gradle.ext.IdeaExtPlugin`，两个不同 MDG 版本带来两个类加载器各装一次，以 `Cannot add extension with name 'settings'` 炸掉同步。CLI 构建不走这条路，所以只在 IDEA 同步时暴露。
-6. 不提交 token、账号、密码、私有仓库凭据、IDE 运行缓存或 `build/` 输出。
+7. 改共享 `src/` 前先确认 IDEA 同步是干净的：同步失败时根 `src/` 不会被标成 source root，IDEA 会对里面的文件报“outside of the module source root”——此时**重同步**，不要点 Move to source root（它会把文件搬到别处）。
+8. 不提交 token、账号、密码、私有仓库凭据、IDE 运行缓存或 `build/` 输出。
 
 ### 构建命令
 
 所有版本由根目录的 Stonecutter 统一构建（`./gradlew build` 一次构建全部四个节点与 `common`）：
 
 ```powershell
-.\gradlew.bat :versions:1.20.1-fabric:build
-.\gradlew.bat :versions:1.20.1-forge:build
-.\gradlew.bat :versions:1.21.1-neoforge:build
-.\gradlew.bat :versions:26.1-neoforge:build
+.\gradlew.bat :1.20.1-fabric:build
+.\gradlew.bat :1.20.1-forge:build
+.\gradlew.bat :1.21.1-neoforge:build
+.\gradlew.bat :26.1-neoforge:build
 .\gradlew.bat build
 ```
 
@@ -111,8 +113,8 @@ Stonecutter 的活动版本（`stonecutter.gradle.kts` 中的 `active`，默认 
 ### 手动跑客户端 / 专用服务器
 
 ```powershell
-.\gradlew.bat :versions:1.21.1-neoforge:runClient
-.\gradlew.bat :versions:1.21.1-neoforge:runServer
+.\gradlew.bat :1.21.1-neoforge:runClient
+.\gradlew.bat :1.21.1-neoforge:runServer
 ```
 
 **仓库里已经没有「自动跑游戏」的自测机制了**：`-PrwQuickPlay` / `-PrwSelfTest` 两个运行参数、
@@ -228,7 +230,7 @@ F7 / F8 与时间树都是**世界里**的动作；世界一旦坏到打不开�
 
 ### 回滚窗口与快速重启（neoforge-1.21.1）
 
-F8 回溯分三步：关世界 → 用快照覆盖存档文件 → 重新开世界。前两步之间那段「世界马上要被整体覆盖」的时间叫**回滚窗口**，由 `RewindState.beginDiscard()` / `endDiscard()`（common；target 的 `Rewind` 只是转发门面）标记（`CheckpointController` 在按下 F8 时打开、快照写完后关闭，失败路径也会关）：
+F8 回溯分三步：关世界 → 用快照覆盖存档文件 → 重新开世界。前两步之间那段「世界马上要被整体覆盖」的时间叫**回滚窗口**，由 `RewindState.beginDiscard()` / `endDiscard()`（common 的 `cc.sighs.rewind.Rewind` 门面）标记（`CheckpointController` 在按下 F8 时打开、快照写完后关闭，失败路径也会关）：
 
 - 窗口内所有世界落盘由 `cc.sighs.mixin.RollbackDiscardMixins` 跳过：区块 / 实体 / 玩家数据 / 维度数据 / region 写入 / level.dat，同时跳过 `stopServer` 那个「排空 chunkMap」的循环；关句柄与释放 `session.lock` 不受影响。**改动任何保存路径时要回来对照这些注入点**——漏掉的写入虽然随后会被快照覆盖，但会把文件 mtime 改脏，让反向增量还原误判成「变了」而白拷一遍。
   > 26.1 上的对应物：`SavedData.save(File, HolderLookup$Provider)` 已删除，存档数据的写盘汇点变成 `SavedDataStorage.scheduleSave()`；level.dat 那条从 `saveDataTag(RegistryAccess, WorldData, CompoundTag)` 变成了私有的 `saveLevelData(CompoundTag)`（两条公开入口都汇到它）。其余目标签名不变。
@@ -382,7 +384,7 @@ F9 / `/rewind ui` 打开 `RewindTreeScreen`——「时间树」，一页管所�
 
 ### 发布
 
-用版本节点的 `publishMods` 任务手动发布该节点的 jar 到 CurseForge 和 Modrinth（例如 `.\gradlew.bat :versions:1.20.1-forge:publishMods`）。根 `gradle.properties` 中配置非敏感项目 ID；token 只通过环境变量提供：
+用版本节点的 `publishMods` 任务手动发布该节点的 jar 到 CurseForge 和 Modrinth（例如 `.\gradlew.bat :1.20.1-forge:publishMods`；不带节点路径的 `.\gradlew.bat publishMods` 会聚合全部节点）。根 `gradle.properties` 中配置非敏感项目 ID；token 只通过环境变量提供：
 
 ```powershell
 $env:CURSEFORGE_TOKEN = '...'
@@ -394,26 +396,26 @@ $env:MODRINTH_TOKEN = '...'
 - **只发一个平台**用平台自己的任务：`publishCurseforge` / `publishModrinth`。**别拿 `publishMods` 当「只发 CurseForge」**：它是「两个平台都发」，而且 `publish.gradle` 的凭据预检会把「缺 Modrinth 项目 ID 或 token」直接判成失败（`Cannot publish mods; missing: ...`），哪怕你根本不想发 Modrinth。
 - **更新日志放在仓库根 `CHANGELOG.md`**，上传时按 UTF-8 自动读它（`publish.gradle` 里的 `changelog`；`PUBLISH_CHANGELOG` 环境变量优先）。**不要用环境变量传长日志**：多行 + 非 ASCII 经过 `gradlew.bat` / `cmd` 传到 JVM 时不保证还原（中文会变乱码）。
 
-发布前必须执行该节点的 `build`（例如 `.\gradlew.bat :versions:1.20.1-forge:publishMods` 会先构建），检查 jar 内的 metadata、共享 class、共享资源和版本范围。不要发布错误节点的产物。
+发布前必须执行该节点的 `build`（例如 `.\gradlew.bat :1.20.1-forge:build`；`publishMods` 不保证先构建），检查 jar 内的 metadata、共享 class、共享资源和版本范围。不要发布错误节点的产物。
 
 ## 新增版本节点
 
-本仓库已完成 Stonecutter 迁移：四个版本节点各保留完整源码（`versions/<mc-version>-<loader>/src`），未做 `//?` 条件合并。新增 `(loader, Minecraft 版本)` 时按以下顺序，禁止先删除旧源码再尝试恢复。
+本仓库已完成 Stonecutter 迁移：小差异文件收到共享 `src/`（`//?` 按 loader/版本区分，提交态是活动版本视角），`Rewind` 门面收到 `common`；其余源码仍按版本节点保留。新增 `(loader, Minecraft 版本)` 时按以下顺序，禁止先删除旧源码再尝试恢复。
 
 1. **盘点版本差异**：记录 Minecraft 版本、loader、JDK、mappings、入口、Mixin、资源、依赖与运行配置；先对照 `docs/version-differences/` 看 API 变化点。
 2. **注册节点**：在 `settings.gradle.kts` 的 `match(...)` 里加一行，在 `stonecutter.properties.toml` 里加对应 `[loader."mc"]` 依赖参数。
 3. **复制专属层**：把最接近的现存节点 `src` 整体复制为新节点起点，再按版本差异改；不要在一个节点放多版本分支。
 4. **抽取 common**：仅将不使用平台类型的状态、规则、计算、DTO 和接口迁到 `common`。把 Minecraft 对象转换为 primitive、字符串、UUID 或自定义 DTO 后再跨边界传递。
 5. **迁移资源**：所有版本共用的 assets/data/lang 放到 `common/src/main/resources/`；将 Fabric/Forge/NeoForge metadata 与版本专属 Mixin 配置保留在版本节点。
-6. **迁移依赖**：可从公开仓库解析的依赖写入 `stonecutter.properties.toml` 对应小节（构建脚本里引用）；仅本地提供的 jar 放入该节点的 `libs/`。不要把 loader 依赖放入 `common`。
+6. **迁移依赖**：可从公开仓库解析的依赖写入 `stonecutter.properties.toml` 对应小节（构建脚本里引用）；仅本地提供的 jar 放入该节点的 `libs/`。不要把 loader 依赖放入 `common`。注意 Fabric Loom 在 26.1 处已拆分（`< 26.1` 用 obfuscated `fabric-loom-remap`，`>= 26.1` 用 unobfuscated `fabric-loom`）：现有的 `build.fabric.gradle.kts` 直引 `fabric-loom`，只适用于 1.20.1-fabric 这类旧节点；新增 fabric 26.1+ 节点时对照官方 `template-multiloader` 改用 `dev.kikugie.loom-back-compat` + `loomx` 写法（`loomx.applyMojangMappings()`、`modImplementation` 别名、`loomx.modJar` 取产物，版本号走 `loomx.loom_version`），并在 `settings.gradle.kts` 的 plugins 里补上该插件。
 7. **迁移配置**：模组名称、ID、许可证、作者、描述等共享值放 `stonecutter.properties.toml` 的 `mod.*`；Minecraft、loader、版本范围放版本小节。
-8. **逐节点验证**：运行 `./gradlew :versions/<node>:build`，检查 jar 内容，并做最小 client 与 dedicated server 启动验证；涉及数据或资源时额外运行 data generation/reload 验证。
+8. **逐节点验证**：运行 `./gradlew :<node>:build`，检查 jar 内容，并做最小 client 与 dedicated server 启动验证；涉及数据或资源时额外运行 data generation/reload 验证。
 9. **记录差异**：不能立即统一的 API 或行为差异写入 `docs/version-differences/`，由版本节点适配实现，不能以 common 中的版本判断掩盖。
 
 ## 提交前检查
 
 - `common` 不含平台 import，且所有受影响版本节点均已适配。
-- 每个新增/修改的版本节点用 `./gradlew :versions/<node>:build` 构建通过。
+- 每个新增/修改的版本节点用 `./gradlew :<node>:build` 构建通过。
 - 最终 jar 含正确 metadata、版本专属资源与共享 class/resources。
 - 版本 `libs/` 内容明确且没有误提交的旧 jar。
 - 发布相关改动不包含 token；项目 ID、版本类型、依赖关系和 changelog 已确认。

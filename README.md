@@ -5,7 +5,7 @@
 
 包名与 Gradle group 为 `cc.sighs`，mod id 为 `rewind`，作者 MerrySnow。
 
-项目骨架来自 [SighsTemple](https://github.com/Tower-of-Sighs/SighsTemple) 框架；该框架的迁移工作流为：先将当前 mc 版本的所有源码及资源迁移至 common 部分，再将经查询源码证实存在明显版本差异的内容转移到 targets 中的对应版本下，然后搭建 spi 模式，将 targets 中的内容抽象化，只保留具体实现差异、共通逻辑迁移回 common 部分，最后将当前 targets 下的主版本内容移植到全部所有版本。
+项目骨架来自 [SighsTemple](https://github.com/Tower-of-Sighs/SighsTemple) 框架；该框架的迁移工作流为：先将当前 mc 版本的所有源码及资源迁移至 common 部分，再将经查询源码证实存在明显版本差异的内容转移到 `versions/<mc-version>-<loader>` 中的对应版本节点下，然后搭建 spi 模式，将版本节点中的内容抽象化，只保留具体实现差异、共通逻辑迁移回 common 部分，最后将当前版本节点中的主版本内容移植到全部所有版本。
 
 ## IDEA
 
@@ -19,10 +19,10 @@ Minecraft 依赖。建议装 Stonecutter IDEA 插件切换活动版本；**Gradl
 
 | Version 节点 | 工具链 | 构建命令 |
 | --- | --- | --- |
-| `1.20.1-fabric` | JDK 17 | `./gradlew :versions:1.20.1-fabric:build` |
-| `1.20.1-forge` | JDK 17 | `./gradlew :versions:1.20.1-forge:build` |
-| `1.21.1-neoforge` | JDK 21 | `./gradlew :versions:1.21.1-neoforge:build` |
-| `26.1-neoforge` | JDK 25 | `./gradlew :versions:26.1-neoforge:build` |
+| `1.20.1-fabric` | JDK 17 | `./gradlew :1.20.1-fabric:build` |
+| `1.20.1-forge` | JDK 17 | `./gradlew :1.20.1-forge:build` |
+| `1.21.1-neoforge` | JDK 21 | `./gradlew :1.21.1-neoforge:build` |
+| `26.1-neoforge` | JDK 25 | `./gradlew :26.1-neoforge:build` |
 
 一次构建全部版本（所需 JDK 由工具链自动提供）：
 
@@ -33,8 +33,8 @@ Minecraft 依赖。建议装 Stonecutter IDEA 插件切换活动版本；**Gradl
 手动跑客户端 / 专用服务器：
 
 ```powershell
-.\gradlew.bat :versions:1.21.1-neoforge:runClient
-.\gradlew.bat :versions:1.21.1-neoforge:runServer
+.\gradlew.bat :1.21.1-neoforge:runClient
+.\gradlew.bat :1.21.1-neoforge:runServer
 ```
 
 ## 结构
@@ -77,7 +77,7 @@ $env:CURSEFORGE_TOKEN = '...'
 $env:MODRINTH_TOKEN = '...'
 $env:PUBLISH_CHANGELOG = '本次版本的更新说明' # 可选
 
-.\gradlew.bat :versions:1.20.1-forge:publishMods
+.\gradlew.bat :1.20.1-forge:publishMods
 ```
 
 将节点路径替换为其他版本即可单独发布对应加载器和 Minecraft 版本。Fabric 会上传重映射后的 jar；Forge 与 NeoForge 上传各自的最终 jar。

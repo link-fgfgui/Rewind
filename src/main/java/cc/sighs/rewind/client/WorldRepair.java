@@ -1,7 +1,11 @@
 package cc.sighs.rewind.client;
 
 import java.nio.file.Path;
+//? if fabric {
+/*import org.jetbrains.annotations.Nullable;
+*///?} else {
 import javax.annotation.Nullable;
+//?}
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
@@ -14,10 +18,10 @@ import cc.sighs.rewind.snapshot.SnapshotMeta;
  * 「读取存档点」：世界选择界面那颗按钮背后干的事。
  *
  * <p>它干活的时机是**世界还没进**，所以一条都不能碰服务器：存档目录由存档名直接拼出来
- * （1.20.1 的 {@code LevelStorageSource.getLevelPath(String)} 是 private，所以走 {@code getBaseDir()}，
- * 与原版 {@code levelSummaryReader} 里那条路径同一个算法），还原走 {@link RewindApi#restoreFiles}——
- * 纯文件操作、任意线程可调。F8 那条带过渡的在线管线在这里用不了：它要求 {@code minecraft.level} 与
- * {@code player} 都在。
+ * （1.20.1 的 {@code LevelStorageSource.getLevelPath(String)} 是 private，走 {@code getBaseDir()}；
+ * 1.21.1+ 直接 {@code getLevelPath}，与原版算法一致），还原走 {@link RewindApi#restoreFiles}——
+ * 纯文件操作、任意线程可调。F8 那条带过渡的在线管线在这里用不了：它要求
+ * {@code minecraft.level} 与 {@code player} 都在。
  *
  * <p>目标存档点交给 {@link RewindApi#repairSlot}：时间线的头（世界当前站着的那个），取不到时退回
  * 最新的完整存档点。存档被别的实例锁着（原版 {@code isDisabled()}）时不给修——那会儿世界文件正被
@@ -61,7 +65,11 @@ public final class WorldRepair {
             return null;
         }
         try {
-            return Minecraft.getInstance().getLevelSource().getBaseDir().resolve(summary.getLevelId());
+            //? if <1.21 {
+            /*return Minecraft.getInstance().getLevelSource().getBaseDir().resolve(summary.getLevelId());
+            *///?} else {
+            return Minecraft.getInstance().getLevelSource().getLevelPath(summary.getLevelId());
+            //?}
         } catch (Throwable t) {
             Rewind.LOGGER.warn("Rewind: could not resolve the folder of world \"{}\"", summary.getLevelId(), t);
             return null;

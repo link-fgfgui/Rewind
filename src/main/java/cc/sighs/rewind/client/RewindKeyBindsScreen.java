@@ -3,7 +3,11 @@ package cc.sighs.rewind.client;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Options;
 import net.minecraft.client.gui.screens.Screen;
+//? if <1.21 {
+/*import net.minecraft.client.gui.screens.controls.KeyBindsScreen;
+*///?} else {
 import net.minecraft.client.gui.screens.options.controls.KeyBindsScreen;
+//?}
 
 /**
  * 只列 Rewind 那两个热键的按键绑定页——本质就是原版那一页，只是列表被筛过。
@@ -14,6 +18,9 @@ import net.minecraft.client.gui.screens.options.controls.KeyBindsScreen;
  *
  * <p>为什么要筛而不是自己画一页：改键那一套交互（点一下等按键、Esc 取消、撞键标红、重置）
  * 全在 {@code KeyBindsList$KeyEntry} 里，自己重写一遍只会走样。
+ *
+ * <p>包名按版本走：1.20.1 还在 {@code ...gui.screens.controls}，1.21.1+ 挪到了
+ * {@code ...gui.screens.options.controls}；构造函数签名 {@code (Screen, Options)} 一致。
  */
 public final class RewindKeyBindsScreen extends KeyBindsScreen {
     public RewindKeyBindsScreen(Screen parent, Options options) {
