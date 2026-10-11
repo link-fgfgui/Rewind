@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -137,6 +138,64 @@ class ZPackChainRebakeTest {
         assertBranch(afterChain, after, expect, "s12");
         assertBranch(afterChain, after, expect, "s14");
         assertBranch(afterChain, after, expect, "s10");
+    }
+
+    /**
+     * TODO2-FIX #1 回归：30 深链重烘焙后体积不得膨胀、关键帧节律不得漂移。
+     *
+     * <p>旧 Bug：`chainDepth` 只看祖先是否有该 key，不看其实际写成 FULL 还是 DELTA，
+     * 自第 21 个节点起深度累积恒 ≥K，s21..s30 全部退化为无字典 FULL（体积暴涨约 10 倍）。
+     */
+    @Test
+    void thirtyNodeChainRebakeKeepsKeyframeCadenceAndSize() throws Exception {
+        final int nodes = 30;
+        final int rawSize = 16 * 1024;
+        final String key = key(0);
+        // 建点阶段用生产同款规则（ZPackChain.deltaDepth + needsKeyframe）造链：
+        // s1 无基底 FULL，此后连续 DELTA 满 20 个（s2..s21）在 s22 处再落一个关键帧。
+        ZPackChain chain = new ZPackChain(SnapshotLayout.snapshotRoot(worldRoot));
+        SnapshotIndex index = SnapshotIndex.empty();
+        List<SnapshotMeta> metas = new ArrayList<>();
+        byte[] cur = nbt(rawSize, 7);
+        String parent = "";
+        for (int s = 1; s <= nodes; s++) {
+            byte[] next = cur.clone();
+            next[(s * 131) % rawSize] ^= (byte) s;
+            byte[] dict = s == 1 ? null : cur;
+            boolean forceFull = dict == null
+                    || ZPackChain.needsKeyframe(chain.deltaDepth(parent, key, index));
+            ZPack.Writer w = new ZPack.Writer();
+            w.add(ZPack.buildEntry(ZPack.TYPE_CHUNK, "dim", 0L, next, dict, forceFull, 3));
+            writePack("s" + s, w);
+            SnapshotMeta m = meta("s" + s, parent);
+            metas.add(m);
+            index.put(m, m.slot);
+            cur = next;
+            parent = "s" + s;
+        }
+        putIndex(metas.toArray(new SnapshotMeta[0]));
+        long before = FullTreeRebakeWorker.directorySize(SnapshotLayout.snapshotRoot(worldRoot));
+        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot, null);
+        assertEquals(nodes, result.liveSlots);
+        assertEquals(0, result.droppedTombstones);
+        long after = FullTreeRebakeWorker.directorySize(SnapshotLayout.snapshotRoot(worldRoot));
+        assertTrue(after <= before, "重烘焙后体积不得膨胀：" + before + " -> " + after);
+        // 关键帧节律：仅 s1/s22 为 FULL 锚点，其余槽位保持 DELTA
+        for (int s = 1; s <= nodes; s++) {
+            ZPack.Packed packed = ZPack.read(
+                    Files.readAllBytes(SnapshotLayout.zpackFile(worldRoot, "s" + s)));
+            assertEquals(1, packed.entries.size(), "s" + s + " 条目数");
+            int mode = packed.entries.get(0).mode;
+            if (s == 1 || s == 22) {
+                assertEquals(ZPack.MODE_FULL, mode, "s" + s + " 应为关键帧锚点");
+            } else {
+                assertEquals(ZPack.MODE_DELTA, mode, "s" + s + " 应保持差分链");
+            }
+        }
+        // 最深节点仍逐字节还原
+        SnapshotIndex afterIndex = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
+        ZPackChain afterChain = new ZPackChain(SnapshotLayout.snapshotRoot(worldRoot));
+        assertArrayEquals(cur, afterChain.resolveAll("s" + nodes, afterIndex).get(key));
     }
 
     private static String key(int k) {

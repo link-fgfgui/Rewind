@@ -14,7 +14,7 @@ import java.util.zip.GZIPOutputStream;
  *
  * <p>Phase 2 弃用 4 KiB 物理扇区快照后，{@code WorldRepair} 不再盲写扇区二进制块，
  * 改为在本类中由目标槽位 zpack 链还原出的全量未压缩 NBT（{@code byte[]}，调用方经
- * {@link ZPackChain} 取得）在内存中完成：压缩（Deflate/GZIP/NONE/LZ4 透传）、
+ * {@link ZPackChain} 取得）在内存中完成：压缩（GZIP/DEFLATE/NONE，LZ4 不支持）、
  * 写入 5 字节 Anvil 头、4 KiB 扇区对齐、生成 {@code .mca} 文件（超 1 MiB 自动
  * 输出 {@code .mcc} 外溢 stub + 独立载荷）。
  *
@@ -80,7 +80,7 @@ public final class AnvilPacker {
             int total = 5 + payload.length;
             int sectors = (total + SECTOR - 1) / SECTOR;
             boolean ext = sectors >= EXTERNAL_CHUNK_THRESHOLD;
-            compressed.put(e.getKey(), ext ? payload : payload);
+            compressed.put(e.getKey(), payload);
             external.put(e.getKey(), ext);
             versions.put(e.getKey(), c.versionId);
         }

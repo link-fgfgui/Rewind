@@ -165,6 +165,9 @@ public final class FullTreeRebakeWorker {
         }
         // 按拓扑序逐个重算差分写入 tmp（父先子后，保证新父 raw 已就绪）
         Map<String, Map<String, byte[]>> rebased = new LinkedHashMap<>();
+        // 每个已重烘焙槽位实际写成 MODE_FULL 的 key 集合（关键帧锚点）：
+        // chainDepth 据此截断差分链，FULL 锚点之后深度归零
+        Map<String, Set<String>> fullKeyframes = new LinkedHashMap<>();
         SnapshotIndex newIndex = SnapshotIndex.empty();
         newIndex.setHead(remapHead(index.getHead(), live));
         newIndex.setLastRollbackAt(index.getLastRollbackAt());
@@ -178,17 +181,23 @@ public final class FullTreeRebakeWorker {
             ZPack.Writer writer = new ZPack.Writer();
             List<String> keys = new ArrayList<>(full.keySet());
             Collections.sort(keys);
+            Set<String> slotFullKeys = new java.util.HashSet<>();
             for (String key : keys) {
                 byte[] raw = full.get(key);
                 byte[] dict = parentRaw == null ? null : parentRaw.get(key);
-                boolean forceFull = dict == null
-                        || ZPackChain.needsKeyframe(chainDepth(rebased, newIndex, meta.parentSlot, key));
+                boolean forceFull = dict == null || ZPackChain.needsKeyframe(
+                        chainDepth(rebased, newIndex, fullKeyframes, meta.parentSlot, key));
                 // 由 key 还原 (type,id,chunkPos)
                 ZPack.ParsedKey parsed = ZPack.parseKey(key);
                 ZPack.Entry entry = ZPack.buildEntry(parsed.targetType, parsed.id, parsed.chunkPos,
                         raw, dict, forceFull, ZstdDelta.DEFAULT_LEVEL);
+                // 以实际写出的模式记账（含膨胀兜底自动 FULL），供后代链深判定
+                if (entry.mode == ZPack.MODE_FULL) {
+                    slotFullKeys.add(key);
+                }
                 writer.add(entry);
             }
+            fullKeyframes.put(slot, slotFullKeys);
             byte[] zpackBytes = writer.toBytes();
             Path tmpZpack = tmpRoot.resolve(slot + SnapshotLayout.ZPACK_SUFFIX);
             Files.write(tmpZpack, zpackBytes);
@@ -290,17 +299,27 @@ public final class FullTreeRebakeWorker {
         return live.contains(head) ? head : "";
     }
 
-    /** 新树下的连续 DELTA 深度（rebased 内自顶向下数）。 */
+    /**
+     * 新树下的连续 DELTA 深度（rebased 内自顶向下数）。
+     *
+     * <p>以重烘焙<b>实际写出</b>的条目模式为准：祖先对应 key 被写成 FULL 关键帧
+     * （forceFull 或膨胀兜底）时立即截断——该锚点不参与差分链，深度归零重数。
+     * 与建点侧 {@link ZPackChain#deltaDepth} 同语义，避免深链拍平后深度累积
+     * 导致全体退化 FULL。
+     */
     private static int chainDepth(Map<String, Map<String, byte[]>> rebased,
-            SnapshotIndex newIndex, String parentSlot, String key) {
-        // 重烘焙输出保证：若父有该 key 且父链连续 DELTA，则深度+1；简化为按父链长度估算
-        // 精确深度需读已写 tmp zpack；此处用 rebased 规模做保守估计（≥K 即 FULL，宁多不少）
+            SnapshotIndex newIndex, Map<String, Set<String>> fullKeyframes,
+            String parentSlot, String key) {
         int depth = 0;
         String current = parentSlot;
         int steps = 0;
         while (current != null && !current.isEmpty() && steps++ < 64) {
             Map<String, byte[]> raw = rebased.get(current);
             if (raw == null || !raw.containsKey(key)) {
+                break;
+            }
+            Set<String> fullKeys = fullKeyframes.get(current);
+            if (fullKeys != null && fullKeys.contains(key)) {
                 break;
             }
             depth++;
@@ -313,6 +332,10 @@ public final class FullTreeRebakeWorker {
         return depth;
     }
 
+    /**
+     * 校验临时区：全部新 zpack 全量试解压（内含逐包 XXH64 比对）后，
+     * 再与重烘焙前内存态做 {@code Arrays.equals} 逐字节一致比对。
+     */
     private static void verifyTmp(Path worldRoot, Path tmpRoot, SnapshotIndex newIndex,
             Map<String, Map<String, byte[]>> expected) throws IOException {
         ZPackChain tmpChain = new ZPackChain(tmpRoot);
@@ -324,19 +347,11 @@ public final class FullTreeRebakeWorker {
                 throw new IOException("rebake verify failed for " + slot
                         + ": size " + got.size() + " != " + want.size());
             }
-            try {
-                java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-                for (Map.Entry<String, byte[]> entry : want.entrySet()) {
-                    byte[] actual = got.get(entry.getKey());
-                    if (actual == null || !java.util.Arrays.equals(actual, entry.getValue())) {
-                        throw new IOException("rebake verify mismatch for " + slot + " key " + entry.getKey());
-                    }
-                    digest.update(actual);
+            for (Map.Entry<String, byte[]> entry : want.entrySet()) {
+                byte[] actual = got.get(entry.getKey());
+                if (actual == null || !java.util.Arrays.equals(actual, entry.getValue())) {
+                    throw new IOException("rebake verify mismatch for " + slot + " key " + entry.getKey());
                 }
-                // SHA-256 走一遍，确保解压数据可哈希（防静默截断）
-                digest.digest();
-            } catch (java.security.NoSuchAlgorithmException ex) {
-                throw new IOException("SHA-256 unavailable", ex);
             }
         }
     }

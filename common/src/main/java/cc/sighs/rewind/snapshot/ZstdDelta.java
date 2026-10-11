@@ -168,6 +168,21 @@ public final class ZstdDelta {
         return patchLength >= standaloneFullLength;
     }
 
+    /**
+     * 载荷算法判别（写包时记录进 zpack 模式字节，跨环境自描述）。
+     *
+     * <p>zstd 帧以 4 字节魔数 0x28 0xB5 0x2F 0xFD 打头；其余一律按 JDK Deflate 兜底。
+     * 判别仅用于标注，读取端另有换算法重试 + XXH64 校验兜底。
+     */
+    static int algorithmOf(byte[] payload) {
+        if (payload != null && payload.length >= 4
+                && (payload[0] & 0xFF) == 0x28 && (payload[1] & 0xFF) == 0xB5
+                && (payload[2] & 0xFF) == 0x2F && (payload[3] & 0xFF) == 0xFD) {
+            return ZPack.ALGO_ZSTD;
+        }
+        return ZPack.ALGO_DEFLATE;
+    }
+
     // ------------------------------------------------------------- 内部
 
     private static byte[] tryDecompressFull(byte[] patch, int originalLength) {
@@ -271,7 +286,8 @@ public final class ZstdDelta {
         return bos.toByteArray();
     }
 
-    private static byte[] inflate(byte[] compressed, int originalLength) throws IOException {
+    /** 解码 Deflate 兜底载荷（{@link ZPack#ALGO_DEFLATE} 自描述路径用；与 {@link #deflate} 互逆）。 */
+    static byte[] inflate(byte[] compressed, int originalLength) throws IOException {
         java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(compressed);
         java.util.zip.InflaterInputStream in = new java.util.zip.InflaterInputStream(bis);
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(

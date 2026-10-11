@@ -72,13 +72,14 @@ public final class ZPackChain {
             }
             for (ZPack.Entry entry : packed.entries) {
                 String key = entry.key();
-                byte[] base = current.get(key);
-                // LRU 命中直接复用已解析的同槽位同 key
+                // LRU 命中直接复用已解析的同槽位同 key：中间祖先槽位同样可短路重放
+                // （分支共享前缀链时，深层解析无需从根重新解压重算）
                 byte[] cached = cached(slot, key);
-                if (cached != null && i == packs.size() - 1) {
+                if (cached != null) {
                     current.put(key, cached);
                     continue;
                 }
+                byte[] base = current.get(key);
                 byte[] raw;
                 if (entry.mode == ZPack.MODE_FULL) {
                     raw = ZPack.resolveEntry(entry, null);

@@ -25,13 +25,13 @@ import java.util.Map;
  *   标识符:
  *     区块类: 维度 ID 字符串 (2B 长度 + UTF-8) + chunkPos 8B long
  *     DATA_FILE: 相对路径字符串 (2B 长度 + UTF-8)
- *   存储模式 1B: 0x00 DELTA / 0x01 FULL
+ *   存储模式 1B: 0x00 DELTA / 0x01 FULL；高位 0x80 = Deflate 兜底载荷（JNI 缺席环境写入）
  *   原始未压缩长度 4B uint32
  *   校验和 8B uint64 (未压缩 NBT 的 XXH64, seed 0)
  *   载荷偏移 8B uint64 (文件绝对偏移, 大端)
  *   压缩载荷长度 4B uint32
  * [Payload Data Block]
- *   按 Entry 顺序排列的连续 Zstd 载荷流
+ *   按 Entry 顺序排列的连续载荷流（Zstd 帧；模式字节标 0x80 的 Entry 为 JDK Deflate 字节流）
  * </pre>
  *
  * <p>Java 8 兼容、无 Minecraft 依赖。读写均为大端，与 DataOutputStream 一致。
@@ -57,6 +57,18 @@ public final class ZPack {
     public static final int MODE_DELTA = 0x00;
     /** 存储模式：独立无字典 Zstd 压缩（无基底/膨胀/关键帧 Anchor）。 */
     public static final int MODE_FULL = 0x01;
+    /**
+     * 存储模式字节的高位标志：载荷为 JDK Deflate 兜底字节流（JNI 缺席环境写入），而非 Zstd 帧。
+     *
+     * <p>格式自描述：读取端据此直接选解压器，跨环境（无 JNI 建点 → 有 JNI 打开）不再靠
+     * 运行环境猜测；老读者遇到置位模式按“未知模式”拒绝，不会拿 Zstd 硬解 Deflate。
+     */
+    public static final int MODE_FLAG_DEFLATE = 0x80;
+
+    /** 载荷算法：Zstd（有字典则为字典差分，无字典为独立帧）。 */
+    public static final int ALGO_ZSTD = 0;
+    /** 载荷算法：纯 JDK Deflate 兜底（ZstdDelta 在 JNI 缺席时的降级输出）。 */
+    public static final int ALGO_DEFLATE = 1;
 
     /** 增量链深阈值：自上一 FULL 起超过 K 即强制 FULL 关键帧（抑制 O(N) 解压雪崩）。 */
     public static final int KEYFRAME_CHAIN_LIMIT = 20;
@@ -72,16 +84,19 @@ public final class ZPack {
         /** 区块类有效；DATA_FILE 为 0。 */
         public final long chunkPos;
         public final int mode;
+        /** 载荷算法：{@link ZPack#ALGO_ZSTD} / {@link ZPack#ALGO_DEFLATE}（随模式字节自描述）。 */
+        public final int algorithm;
         public final int rawLength;
         public final long xxh64;
         public final byte[] payload;
 
-        public Entry(int targetType, String id, long chunkPos, int mode,
+        public Entry(int targetType, String id, long chunkPos, int mode, int algorithm,
                 int rawLength, long xxh64, byte[] payload) {
             this.targetType = targetType;
             this.id = id;
             this.chunkPos = chunkPos;
             this.mode = mode;
+            this.algorithm = algorithm;
             this.rawLength = rawLength;
             this.xxh64 = xxh64;
             this.payload = payload;
@@ -231,7 +246,8 @@ public final class ZPack {
             if (e.isChunkLike()) {
                 writeLong(row, e.chunkPos);
             }
-            row.write(e.mode);
+            // 模式字节高位记录载荷算法（Deflate 兜底），格式自描述
+            row.write(e.mode | (e.algorithm == ALGO_DEFLATE ? MODE_FLAG_DEFLATE : 0));
             writeU32(row, e.rawLength);
             writeLong(row, e.xxh64);
             writeLong(row, payloadOffset);
@@ -316,10 +332,13 @@ public final class ZPack {
             if (pos + 1 + 4 + 8 + 8 + 4 > file.length) {
                 throw new EOFException("zpack entry fields truncated at entry " + i);
             }
-            int mode = file[pos++] & 0xFF;
+            int modeByte = file[pos++] & 0xFF;
+            boolean deflatePayload = (modeByte & MODE_FLAG_DEFLATE) != 0;
+            int mode = modeByte & ~MODE_FLAG_DEFLATE;
             if (mode != MODE_DELTA && mode != MODE_FULL) {
-                throw new IOException("unknown zpack mode: " + mode);
+                throw new IOException("unknown zpack mode: " + modeByte);
             }
+            int algorithm = deflatePayload ? ALGO_DEFLATE : ALGO_ZSTD;
             long rawLength = readU32Long(file, pos);
             pos += 4;
             long xxh64 = readLong(file, pos);
@@ -336,7 +355,8 @@ public final class ZPack {
             }
             payloadWindows.add(new long[]{payloadOffset, payloadLength});
             // 暂存占位 Entry，载荷第二遍切出
-            entries.add(new Entry(type, id, chunkPos, mode, (int) rawLength, xxh64, new byte[0]));
+            entries.add(new Entry(type, id, chunkPos, mode, algorithm,
+                    (int) rawLength, xxh64, new byte[0]));
         }
         // 切出载荷并校验窗口
         List<Entry> finished = new ArrayList<>(entries.size());
@@ -350,7 +370,8 @@ public final class ZPack {
             }
             byte[] payload = new byte[(int) len];
             System.arraycopy(file, (int) off, payload, 0, (int) len);
-            finished.add(new Entry(e.targetType, e.id, e.chunkPos, e.mode, e.rawLength, e.xxh64, payload));
+            finished.add(new Entry(e.targetType, e.id, e.chunkPos, e.mode, e.algorithm,
+                    e.rawLength, e.xxh64, payload));
         }
         return new Packed(version, flags, Collections.unmodifiableList(finished));
     }
@@ -374,25 +395,36 @@ public final class ZPack {
         long checksum = Xxh64.hash(raw);
         byte[] full = ZstdDelta.compressFull(raw, level);
         if (forceFull || dict == null || dict.length == 0) {
-            return new Entry(targetType, id, chunkPos, MODE_FULL, raw.length, checksum, full);
+            return new Entry(targetType, id, chunkPos, MODE_FULL,
+                    ZstdDelta.algorithmOf(full), raw.length, checksum, full);
         }
         byte[] patch = ZstdDelta.compressDelta(raw, dict, level);
         if (ZstdDelta.shouldStoreFull(patch.length, full.length)) {
-            return new Entry(targetType, id, chunkPos, MODE_FULL, raw.length, checksum, full);
+            return new Entry(targetType, id, chunkPos, MODE_FULL,
+                    ZstdDelta.algorithmOf(full), raw.length, checksum, full);
         }
-        return new Entry(targetType, id, chunkPos, MODE_DELTA, raw.length, checksum, patch);
+        return new Entry(targetType, id, chunkPos, MODE_DELTA,
+                ZstdDelta.algorithmOf(patch), raw.length, checksum, patch);
     }
 
-    /** 解开单个 Entry（DELTA 需 dict；FULL 传 null），并校验 XXH64。 */
+    /**
+     * 解开单个 Entry（DELTA 需 dict；FULL 传 null），并校验 XXH64。
+     *
+     * <p>按 Entry 自描述的算法解压；若该算法失败则换另一种重试（老包未标算法/极端混写的
+     * 防御性兜底），最终一致性由 XXH64 校验兜住。
+     */
     public static byte[] resolveEntry(Entry entry, byte[] dictRaw) throws IOException {
-        byte[] raw;
-        if (entry.mode == MODE_FULL) {
-            raw = ZstdDelta.decompress(entry.payload, null, entry.rawLength);
-        } else {
-            if (dictRaw == null) {
-                throw new IOException("delta entry has no base: " + entry.key());
-            }
-            raw = ZstdDelta.decompress(entry.payload, dictRaw, entry.rawLength);
+        if (entry.mode == MODE_DELTA && dictRaw == null) {
+            throw new IOException("delta entry has no base: " + entry.key());
+        }
+        byte[] raw = decodePayload(entry, dictRaw, entry.algorithm);
+        if (raw == null) {
+            raw = decodePayload(entry, dictRaw,
+                    entry.algorithm == ALGO_DEFLATE ? ALGO_ZSTD : ALGO_DEFLATE);
+        }
+        if (raw == null) {
+            throw new IOException("zpack payload undecodable for " + entry.key()
+                    + " (algorithm=" + entry.algorithm + ")");
         }
         if (raw.length != entry.rawLength) {
             throw new IOException("zpack length mismatch for " + entry.key()
@@ -404,6 +436,20 @@ public final class ZPack {
                     entry.key(), entry.xxh64, actual));
         }
         return raw;
+    }
+
+    /** 按指定算法解开载荷；失败返回 null（调用方换算法重试）。 */
+    private static byte[] decodePayload(Entry entry, byte[] dictRaw, int algorithm) {
+        try {
+            if (algorithm == ALGO_DEFLATE) {
+                // 兜底 Deflate 是独立流（无字典概念）：DELTA 载荷同样直接 inflate
+                return ZstdDelta.inflate(entry.payload, entry.rawLength);
+            }
+            return ZstdDelta.decompress(entry.payload,
+                    entry.mode == MODE_DELTA ? dictRaw : null, entry.rawLength);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ---------------------------------------------------------- 编解码小工具（大端）

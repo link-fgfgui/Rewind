@@ -479,7 +479,7 @@ public final class InPlaceRollback {
             covered += populateCoverForLevel(slotDir, blocks, store, zpackCover, entry.getKey(), entry.getValue(),
                     result);
         }
-        covered += populateDataCover(server, slotDir, dataFiles);
+        covered += populateDataCover(server, worldRoot, slotDir, zpackCover, dataFiles);
         result.coverPopulated = covered;
         result.mirror = "cover=" + covered;
         result.mirrorCopied = covered;
@@ -597,6 +597,10 @@ public final class InPlaceRollback {
     /**
      * 非区块 NBT 灌装：把槽位的 {@code .dat} 读进数据覆盖层（快照目录，允许）。
      *
+     * <p>数据源二选一：优先 zpack 快路（按世界根相对路径匹配 {@code TYPE_DATA_FILE}，
+     * 载荷为未压缩 NBT 字节，命中即解码灌装）；未命中或解码失败回退读槽位磁盘文件——
+     * “zpack 里没有”永不等价于删除（链上可能有洞/老槽位无包）。
+     *
      * <p>存档数据按“活文件绝对路径”拼键（与读写两端的键一致）：每个维度的
      * {@code DimensionDataStorage} 数据目录在槽位里找同名 {@code .dat}，
      * 有就读入覆盖，没有就记删除标记（回滚后懒加载不再复活未来文件）。
@@ -605,9 +609,10 @@ public final class InPlaceRollback {
      *
      * @return 灌装计数；dataFiles 收集本次覆盖到的存档数据文件相对路径（世界根基准，给日志用）
      */
-    private static int populateDataCover(MinecraftServer server, Path slotDir, List<String> dataFiles) {
+    private static int populateDataCover(MinecraftServer server, Path worldRoot, Path slotDir,
+            Map<String, byte[]> zpackCover, List<String> dataFiles) {
         int covered = 0;
-        Path worldRoot = server.getWorldPath(LevelResource.LEVEL_DATA_FILE).getParent();
+        NeoForgeRewindPlatform platform = zpackCover == null ? null : new NeoForgeRewindPlatform();
         Set<String> seenDataKeys = new HashSet<>();
         for (ServerLevel level : server.getAllLevels()) {
             DimensionDataStorageAccess access =
@@ -659,6 +664,37 @@ public final class InPlaceRollback {
                 if (!seenDataKeys.add(key)) {
                     continue;
                 }
+                String relative = null;
+                try {
+                    relative = SnapshotLayout.relativize(worldRoot, liveFile.toPath());
+                } catch (Throwable ignored) {
+                    // 相对化失败只影响 zpack 快路与日志，不影响槽位盘读
+                }
+                // zpack 快路：命中即灌装；未命中/解码失败一律回退槽位盘读（链洞≠删除）
+                if (zpackCover != null && relative != null) {
+                    byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, relative, 0L));
+                    if (raw != null) {
+                        try {
+                            if (raw.length == 0) {
+                                RewindState.dataCover().onWritten(key, null);
+                                covered++;
+                                continue;
+                            }
+                            Object tag = platform.decodeChunkSector(raw);
+                            if (tag instanceof CompoundTag) {
+                                RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
+                                covered++;
+                                dataFiles.add(relative);
+                                continue;
+                            }
+                            Rewind.LOGGER.warn("Rewind: zpack data entry {} undecodable, falling back to slot file",
+                                    relative);
+                        } catch (Throwable t) {
+                            Rewind.LOGGER.warn("Rewind: zpack data entry {} failed, falling back to slot file",
+                                    relative, t);
+                        }
+                    }
+                }
                 if (!Files.isRegularFile(slotFile)) {
                     RewindState.dataCover().onWritten(key, null);
                     continue;
@@ -667,10 +703,8 @@ public final class InPlaceRollback {
                     CompoundTag full = NbtIo.readCompressed(slotFile, NbtAccounter.unlimitedHeap());
                     RewindState.dataCover().onWritten(key, full.copy());
                     covered++;
-                    try {
-                        dataFiles.add(SnapshotLayout.relativize(worldRoot, liveFile.toPath()));
-                    } catch (Throwable ignored) {
-                        // 相对化失败不影响覆盖本身
+                    if (relative != null) {
+                        dataFiles.add(relative);
                     }
                 } catch (Throwable t) {
                     Rewind.LOGGER.warn("Rewind: cannot read checkpoint data file {}, skipping cover for it",
@@ -679,9 +713,36 @@ public final class InPlaceRollback {
             }
         }
         // 玩家数据：在线的按槽位读入，缺席记删除标记
+        Path livePlayerDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             String key = cc.sighs.mixin.DataJournalMixins.playerKey(player.getStringUUID());
             Path slotFile = slotDir.resolve("playerdata").resolve(player.getStringUUID() + ".dat");
+            String liveRelative = SnapshotLayout.relativize(worldRoot,
+                    livePlayerDir.resolve(player.getStringUUID() + ".dat"));
+            // zpack 快路（世界根相对路径键）；.dat_old 不在 zpack 内，未命中照旧回退盘读
+            if (zpackCover != null) {
+                byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, liveRelative, 0L));
+                if (raw != null) {
+                    try {
+                        if (raw.length == 0) {
+                            RewindState.dataCover().onWritten(key, null);
+                            covered++;
+                            continue;
+                        }
+                        Object tag = platform.decodeChunkSector(raw);
+                        if (tag instanceof CompoundTag) {
+                            RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
+                            covered++;
+                            continue;
+                        }
+                        Rewind.LOGGER.warn("Rewind: zpack player entry {} undecodable, falling back to slot file",
+                                liveRelative);
+                    } catch (Throwable t) {
+                        Rewind.LOGGER.warn("Rewind: zpack player entry {} failed, falling back to slot file",
+                                liveRelative, t);
+                    }
+                }
+            }
             if (!Files.isRegularFile(slotFile)) {
                 Path oldFile = slotDir.resolve("playerdata").resolve(player.getStringUUID() + ".dat_old");
                 if (Files.isRegularFile(oldFile)) {

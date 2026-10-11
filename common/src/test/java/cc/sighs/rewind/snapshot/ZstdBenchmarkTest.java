@@ -147,9 +147,10 @@ class ZstdBenchmarkTest {
                 resolved.get(ZPack.keyOf(ZPack.TYPE_CHUNK, "dim", 9L))),
                 "25 深链重放必须字节一致");
         System.out.println("deep-chain: depth=" + depth + " totalMs=" + elapsedMs);
-        // 预算：25 跳全量重放 <500ms（≈每跳 <20ms，含文件 IO；快照命中缓存后为微秒级）。
+        // 预算：25 跳全量重放总耗时 <25ms（实测 1~2ms，折合每跳 ~80µs；快照命中缓存后为微秒级）。
+        // 注意口径：§六.2 的“单目标中位数 ≤1ms”指单跳折算值，本断言守的是 25 跳总时长（防退化看门狗），
         // 生产环境另有 FULL 关键帧（K≤20）与 LRU，只会更快。
-        assertTrue(elapsedMs < 500,
+        assertTrue(elapsedMs < 25,
                 "25 深链重放 " + elapsedMs + "ms 超出预算");
     }
 }
