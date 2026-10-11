@@ -25,5 +25,7 @@ public final class RewindFabric implements ModInitializer {
         RewindServerConfig.register();
         // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> RewindState.onWorldUnloaded());
+        // 启动自愈（TODO2 §4.2）：开服读完关卡即检查 GC 崩溃窗口，比任何建点/回滚都早。
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> RewindState.onServerStarted(server));
     }
 }

@@ -49,6 +49,13 @@ public final class RollbackWarmup {
             "cc.sighs.rewind.snapshot.SnapshotBlocks",
             "cc.sighs.rewind.snapshot.SnapshotManifest",
             "cc.sighs.rewind.snapshot.SnapshotMirror",
+            "cc.sighs.rewind.snapshot.ZPack",
+            "cc.sighs.rewind.snapshot.ZPackChain",
+            "cc.sighs.rewind.snapshot.ZPackCheckpoint",
+            "cc.sighs.rewind.snapshot.ZPackOffline",
+            "cc.sighs.rewind.snapshot.ZstdDelta",
+            "cc.sighs.rewind.snapshot.Xxh64",
+            "cc.sighs.rewind.snapshot.AnvilPacker",
             "cc.sighs.rewind.server.InPlaceRollback",
             "net.minecraft.world.level.chunk.storage.RegionFile",
             "net.minecraft.nbt.NbtIo",
@@ -92,6 +99,9 @@ public final class RollbackWarmup {
         // 老格式槽位（整文件、没有块映射）没有块存储可热，直接跳过
         SnapshotBlocks blocks = SnapshotBlocks.load(SnapshotLayout.blockMapFile(worldRoot, slot));
         if (blocks.size() == 0) {
+            // 块存储没有，zpack 也顺手摸一下就走（纯 NBT 回滚读它）
+            readPrefix(SnapshotLayout.zpackFile(worldRoot, slot), new byte[HEADER_BYTES]);
+            loadRollbackClasses();
             return;
         }
         byte[] buffer = new byte[HEADER_BYTES];
@@ -112,7 +122,15 @@ public final class RollbackWarmup {
                 readPrefix(worldRoot.resolve(relative), buffer);
             }
         }
+        // 回滚快路读 zpack 全量表：页缓存顺手摸热
+        readPrefix(SnapshotLayout.zpackFile(worldRoot, slot), buffer);
         loadRollbackClasses();
+        // JNI 本地库在建点后预热（而非第一次 F8 时现解压加载）：纯绑定类，静态初始化只装载 native。
+        try {
+            Class.forName("com.github.luben.zstd.Zstd", true, RollbackWarmup.class.getClassLoader());
+        } catch (Throwable ignored) {
+            // JNI 缺席时回退 JDK Deflate，功能不受影响
+        }
     }
 
     /** 读一个文件的前 {@value #HEADER_BYTES} 字节，只为把页缓存摸热。 */

@@ -156,5 +156,9 @@
   "rewind.repair.start": "开始还原",
   "rewind.repair.running": "正在还原……",
   "rewind.repair.done": "还原完成（%s）",
-  "rewind.repair.failed": "还原失败：%s"
+  "rewind.repair.failed": "还原失败：%s",
+  "rewind.repair.compact": "整理存档点（可释放 %s）",
+  "rewind.repair.compact.running": "正在整理……",
+  "rewind.repair.compact.done": "整理完成（%s）",
+  "rewind.repair.compact.failed": "整理失败：%s"
 }

@@ -156,5 +156,9 @@
   "rewind.repair.start": "Restore now",
   "rewind.repair.running": "Restoring…",
   "rewind.repair.done": "Restored (%s)",
-  "rewind.repair.failed": "Failed: %s"
+  "rewind.repair.failed": "Failed: %s",
+  "rewind.repair.compact": "Compact (%s free)",
+  "rewind.repair.compact.running": "Compacting…",
+  "rewind.repair.compact.done": "Compacted (%s)",
+  "rewind.repair.compact.failed": "Compaction failed: %s"
 }

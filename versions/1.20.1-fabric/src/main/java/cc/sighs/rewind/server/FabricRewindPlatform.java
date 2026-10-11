@@ -128,6 +128,28 @@ public final class FabricRewindPlatform implements RewindPlatform {
     }
 
     /**
+     * 写账本句柄 → 未压缩 NBT 字节（zpack 字典差分建点用，与 {@code decodeChunkSector} 互逆）。
+     *
+     * <p>直出 {@code NbtIo.write}，不压缩——压缩是 zpack 自己的事（字典差分必须吃未压缩字节，
+     * 否则压缩雪崩会把相似性淹掉，见 TODO2 §1.1）。
+     */
+    @Override
+    public byte[] encodeRawNbt(Object tag) {
+        if (!(tag instanceof CompoundTag)) {
+            return null;
+        }
+        try {
+            ByteArrayOutputStream raw = new ByteArrayOutputStream(8192);
+            try (DataOutputStream out = new DataOutputStream(raw)) {
+                NbtIo.write((CompoundTag) tag, out);
+            }
+            return raw.toByteArray();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
      * （种类，维度）→ region 目录相对路径。1.20.1 的维度存储目录：
      * 主世界直接是 {@code region/}，下界/末地是 {@code DIM-1/region/}、{@code DIM1/region/}；
      * 实体/POI 同理。模组自定义维度若用了别的布局，存档文件夹惯例对不上就返回 null

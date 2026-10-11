@@ -83,6 +83,7 @@ public final class SnapshotIndex {
         meta.playerZ = readDouble(slot, "playerZ", 0.0D);
         meta.fileCount = (int) readLong(slot, "fileCount", 0L);
         meta.totalBytes = readLong(slot, "totalBytes", 0L);
+        meta.tombstone = "true".equalsIgnoreCase(properties.getProperty(key(slot, "tombstone"), "false"));
         return meta;
     }
 
@@ -109,6 +110,11 @@ public final class SnapshotIndex {
         properties.setProperty(key(slot, "playerZ"), Double.toString(meta.playerZ));
         properties.setProperty(key(slot, "fileCount"), Integer.toString(meta.fileCount));
         properties.setProperty(key(slot, "totalBytes"), Long.toString(meta.totalBytes));
+        if (meta.tombstone) {
+            properties.setProperty(key(slot, "tombstone"), "true");
+        } else {
+            properties.remove(key(slot, "tombstone"));
+        }
     }
 
     /**
@@ -126,6 +132,29 @@ public final class SnapshotIndex {
             }
         }
         return removed;
+    }
+
+    /**
+     * 该槽位是否为墓碑（游戏内软删除，仅标记隐藏）。
+     */
+    public boolean isTombstoned(String slot) {
+        SnapshotMeta meta = get(slot);
+        return meta != null && meta.tombstone;
+    }
+
+    /**
+     * 设置/清除墓碑标记（只改内存，落盘由 {@link #save(Path)} 负责）。
+     *
+     * @return 槽位是否存在
+     */
+    public boolean setTombstone(String slot, boolean tombstone) {
+        SnapshotMeta meta = get(slot);
+        if (meta == null) {
+            return false;
+        }
+        meta.tombstone = tombstone;
+        put(meta, slot);
+        return true;
     }
 
     /**

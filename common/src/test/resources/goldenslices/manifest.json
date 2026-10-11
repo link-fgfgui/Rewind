@@ -1,0 +1,36 @@
+{
+  "boundary_deflate_expected.nbt": {
+    "bytes": 34745,
+    "sha256": "e6fe59f053b3a733aa8f4c366f123457454df7d39e71ccbe9d0e9bfe515cbbc1"
+  },
+  "boundary_deflate_sector.bin": {
+    "bytes": 4096,
+    "chunk": [
+      0,
+      0
+    ],
+    "i1": 1830,
+    "sha256": "d376d2a6b4e4457093b9783e91ba40f670dfdcd4d997165d984c73de3c6fe851",
+    "version": 2
+  },
+  "t1_base_chunk_14_18.nbt": {
+    "bytes": 5188,
+    "sha256": "7d0a54fd4e24ccf3cb7ee002e298ca2e144f9f30fc9989ba73d552bd8e983d5f"
+  },
+  "t1_base_disk_manager.dat": {
+    "bytes": 25433,
+    "raw_bytes": 122286,
+    "raw_sha256": "758ced171b80e84a6883250d1222014b36b398d09426eec8a2f786c0fc6d2d2b",
+    "sha256": "1cc0f54e247bd937305920a13fe5d53defbd87f7d1a797fbc78cefeb6049fa91"
+  },
+  "t1_target_chunk_14_18.nbt": {
+    "bytes": 5188,
+    "sha256": "8733b3e00b645594cd58dcfbe5062bcfec059e5322a7d55e17a09d4a0dbfa8d6"
+  },
+  "t1_target_disk_manager.dat": {
+    "bytes": 25433,
+    "raw_bytes": 122286,
+    "raw_sha256": "758ced171b80e84a6883250d1222014b36b398d09426eec8a2f786c0fc6d2d2b",
+    "sha256": "1cc0f54e247bd937305920a13fe5d53defbd87f7d1a797fbc78cefeb6049fa91"
+  }
+}

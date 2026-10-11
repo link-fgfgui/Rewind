@@ -138,6 +138,28 @@ public final class NeoForge261RewindPlatform implements RewindPlatform {
     }
 
     /**
+     * 写账本句柄 → 未压缩 NBT 字节（zpack 字典差分建点用，与 {@code decodeChunkSector} 互逆）。
+     *
+     * <p>直出 {@code NbtIo.write}，不压缩——压缩是 zpack 自己的事（字典差分必须吃未压缩字节，
+     * 否则压缩雪崩会把相似性淹掉，见 TODO2 §1.1）。
+     */
+    @Override
+    public byte[] encodeRawNbt(Object tag) {
+        if (!(tag instanceof CompoundTag)) {
+            return null;
+        }
+        try {
+            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream(8192);
+            try (java.io.DataOutputStream out = new java.io.DataOutputStream(raw)) {
+                NbtIo.write((CompoundTag) tag, out);
+            }
+            return raw.toByteArray();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /**
      * （种类，维度）→ region 目录相对路径。26.1 的维度存储目录由
      * {@code DimensionType.getStorageFolder} 决定：{@code dimensions/<命名空间>/<路径>/}，
      * 下面再挂 {@code region/}、{@code entities/}、{@code poi/}。

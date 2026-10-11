@@ -1721,7 +1721,20 @@ public final class RewindTreeScreen extends ApricityScreen {
 
     private static Map<String, SnapshotMeta> loadMetas() {
         Path world = worldRoot();
-        return world == null ? Map.of() : RewindApi.describeAll(world);
+        if (world == null) {
+            return Map.of();
+        }
+        // TODO2 Phase2 §3.3：墓碑槽位仅标记隐藏——时间树跳过它们的卡片，但不断链
+        // （父子边还指着它们，布局按“指向不存在的东西即画成根”处理）。
+        // 覆盖墓碑槽位即复活（建点时清标记），所以 firstFreeSlot 照样能选中它们。
+        Map<String, SnapshotMeta> all = RewindApi.describeAll(world);
+        Map<String, SnapshotMeta> visible = new LinkedHashMap<>();
+        for (Map.Entry<String, SnapshotMeta> entry : all.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().tombstone) {
+                visible.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return visible;
     }
 
     /** 「这个槽位实际占了多少磁盘」的缓存：键是槽位 + 它的建点时刻，变了才重新量。 */

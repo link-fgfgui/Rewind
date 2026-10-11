@@ -85,6 +85,20 @@ public interface RewindPlatform {
     }
 
     /**
+     * 把写账本里的不透明 NBT 句柄编成未压缩 NBT 字节（zpack 字典差分建点用）。
+     *
+     * <p>与 {@link #decodeChunkSector} 互逆：本方法输出的字节交回去必须 round-trip 一致。
+     * 默认返回 null（该槽位不进 zpack，回滚走块存储旧路）。接入的版本用自己的
+     * {@code NbtIo.write}（不压缩，直出）实现。
+     *
+     * @param tag 写账本里存的那个句柄（版本侧的 {@code CompoundTag}）
+     * @return 未压缩 NBT 字节；编不出返回 null
+     */
+    default byte[] encodeRawNbt(Object tag) {
+        return null;
+    }
+
+    /**
      * 增量建点时“(种类, 维度) → region 目录相对路径”的映射（如
      * {@code region}、{@code DIM-1/region}、{@code entities}……，相对世界根，
      * {@code /} 分隔）。默认返回 null（未知布局，涉及该条目的文件回退到磁盘扫描；

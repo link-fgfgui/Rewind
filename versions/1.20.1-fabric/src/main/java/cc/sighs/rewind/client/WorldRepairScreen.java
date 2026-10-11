@@ -11,6 +11,8 @@ import net.minecraft.network.chat.Component;
 import cc.sighs.rewind.Rewind;
 import cc.sighs.rewind.api.RewindApi;
 import cc.sighs.rewind.api.RewindResult;
+import cc.sighs.rewind.snapshot.FullTreeRebakeWorker;
+import cc.sighs.rewind.snapshot.SnapshotSelfHealing;
 
 /**
  * 「读取存档点」的界面：确认目标存档点 → 跑还原 → 把结果说出来。
@@ -52,6 +54,10 @@ public final class WorldRepairScreen extends Screen {
     private Phase phase = Phase.READY;
     @Nullable private Component status;
     @Nullable private Button startButton;
+    @Nullable private Button compactButton;
+    /** 墓碑槽位数与可释放字节（构造时快照，整理完成后重算，按钮随之消失）。 */
+    private int tombstones;
+    private long reclaimable;
 
     public WorldRepairScreen(Screen parent, Path worldRoot, String worldName, String slot) {
         super(Component.translatable("rewind.repair.title", worldName));
@@ -59,6 +65,23 @@ public final class WorldRepairScreen extends Screen {
         this.worldRoot = worldRoot;
         this.slot = slot;
         this.target = WorldRepair.describeTarget(worldRoot, slot);
+        // TODO2 Phase2 §4.2：进修复界面先自愈（消除 GC 让位/就位之间的崩溃窗口），再统计可整理量。
+        SnapshotSelfHealing.healQuietly(worldRoot);
+        this.refreshCompactStats();
+    }
+
+    /** 重算墓碑数与可释放字节（构造与整理完成时各调一次）。 */
+    private void refreshCompactStats() {
+        int count = 0;
+        long bytes = 0L;
+        try {
+            count = FullTreeRebakeWorker.countTombstones(this.worldRoot);
+            bytes = FullTreeRebakeWorker.estimateReclaimableBytes(this.worldRoot);
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: failed to estimate compact savings for {}", this.worldRoot, t);
+        }
+        this.tombstones = count;
+        this.reclaimable = bytes;
     }
 
     @Override
@@ -70,6 +93,13 @@ public final class WorldRepairScreen extends Screen {
         this.addRenderableWidget(
                 Button.builder(CommonComponents.GUI_CANCEL, button -> this.onClose())
                         .bounds(this.width / 2 + 4, this.height - 32, 150, 20)
+                        .build());
+        // TODO2 Phase2 §4.1：墓碑存在时才出现的高亮整理入口（底部按钮区上一行）。
+        this.compactButton = this.addRenderableWidget(
+                Button.builder(Component.translatable("rewind.repair.compact",
+                                FullTreeRebakeWorker.formatBytes(this.reclaimable)),
+                                button -> this.startCompact())
+                        .bounds(this.width / 2 - 154, this.height - 60, 308, 20)
                         .build());
         this.refreshButtons();
     }
@@ -132,6 +162,66 @@ public final class WorldRepairScreen extends Screen {
         if (this.startButton != null) {
             this.startButton.active = this.phase == Phase.READY;
         }
+        // 整理入口：没有墓碑就不出现；动手后与还原按钮一起禁用。
+        if (this.compactButton != null) {
+            this.compactButton.visible = this.tombstones > 0;
+            this.compactButton.active = this.phase == Phase.READY && this.tombstones > 0;
+        }
+    }
+
+    /** 按下「整理存档点」：整树重烘焙丢给后台线程，界面留在原地显示进度。 */
+    private void startCompact() {
+        if (this.phase == Phase.RUNNING || this.tombstones <= 0) {
+            return;
+        }
+        Minecraft minecraft = this.minecraft;
+        if (minecraft == null) {
+            Rewind.LOGGER.warn("Rewind: no client, cannot compact {}", this.worldRoot);
+            return;
+        }
+        this.phase = Phase.RUNNING;
+        this.status = Component.translatable("rewind.repair.compact.running");
+        this.refreshButtons();
+        Thread worker = new Thread(() -> this.compact(minecraft), "rewind-compact");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    /** 后台线程：纯文件操作，一个界面字段都不改。 */
+    private void compact(Minecraft minecraft) {
+        String summary = "";
+        String failure = null;
+        try {
+            FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(this.worldRoot, null);
+            summary = result.summary();
+        } catch (Throwable t) {
+            failure = String.valueOf(t);
+        }
+        final String doneSummary = summary;
+        final String doneFailure = failure;
+        // 回渲染线程再动界面状态
+        minecraft.execute(() -> this.finishCompact(doneSummary, doneFailure));
+    }
+
+    private void finishCompact(String summary, String failure) {
+        if (failure == null) {
+            this.phase = Phase.DONE;
+            this.status = Component.translatable("rewind.repair.compact.done", summary);
+            Rewind.LOGGER.info("Rewind: compacted \"{}\" ({})",
+                    this.worldRoot.getFileName(), summary);
+        } else {
+            this.phase = Phase.FAILED;
+            this.status = Component.translatable("rewind.repair.compact.failed", failure);
+            Rewind.LOGGER.error("Rewind: compacting \"{}\" failed: {}",
+                    this.worldRoot.getFileName(), failure);
+        }
+        // 整理完重算：墓碑已清，按钮随之消失。
+        this.refreshCompactStats();
+        if (this.compactButton != null) {
+            this.compactButton.setMessage(Component.translatable("rewind.repair.compact",
+                    FullTreeRebakeWorker.formatBytes(this.reclaimable)));
+        }
+        this.refreshButtons();
     }
 
     @Override

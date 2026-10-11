@@ -18,6 +18,7 @@ base.archivesName = "${prop("mod.name")}-fabric-${sc.current.version}"
 val requiredJava: JavaVersion = JavaVersion.VERSION_17
 
 repositories {
+    mavenLocal()
     mavenCentral()
     // ApricityUI: HTML/JS-driven UI library used by the time-tree screen
     maven("https://maven.sighs.cc/repository/maven-public/")
@@ -32,6 +33,10 @@ dependencies {
     // UI library (only used by client code; kept here so UI classes resolve everywhere)
     modImplementation(prop("deps.aui"))
     implementation(project(":common"))
+    // TODO2 Phase2 P0：zstd-jni 是纯库（非模组），必须 include 进发行 jar——
+    // 不内嵌则生产环境静默退化成 Deflate。不要进 fabric.mod.json 的 depends（它不是模组）。
+    modImplementation("com.github.luben:zstd-jni:${prop("deps.zstd")}")
+    include("com.github.luben:zstd-jni:${prop("deps.zstd")}")
 }
 
 loom {

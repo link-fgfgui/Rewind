@@ -1,11 +1,14 @@
 package cc.sighs.rewind.common;
 
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import cc.sighs.rewind.common.spi.DataCover;
+import cc.sighs.rewind.common.spi.RewindPlatforms;
 import cc.sighs.rewind.common.spi.StorageKind;
 import cc.sighs.rewind.common.spi.StorageOverlay;
+import cc.sighs.rewind.snapshot.SnapshotSelfHealing;
 
 /**
  * 跨模块共享的全局状态：回滚窗口标记、「原地回滚本轮自己接管的区块」名单，以及存储拦截记下来的写集。
@@ -243,6 +246,28 @@ public final class RewindState {
         disarmStorageCover();
         frozenBases.clear();
         clearUnloadGuards();
+    }
+
+    /**
+     * 服务器启动、世界就绪时调用：执行离线 GC 崩溃窗口的启动自愈（TODO2 §4.2）。
+     *
+     * <p>只认“世界未加载时没人写盘”的那一刻：`WorldRepairScreen` 入口（世界未进）调一次，
+     * 这里（服务端线程，关卡读完、首个 tick 之前）再调一次——直接进世界不经过修复屏时，
+     * 靠的就是这一次。无事时只是几次 `isDirectory`，建点/回滚前早已结束，不存在竞态。
+     * 专用服务器没有修复屏，这次是它唯一的自愈机会。
+     *
+     * @param server 平台自己的服务器对象（原样转交给平台取世界根）
+     */
+    public static void onServerStarted(Object server) {
+        try {
+            Path worldRoot = RewindPlatforms.require().worldRoot(server);
+            SnapshotSelfHealing.Result healed = SnapshotSelfHealing.healQuietly(worldRoot);
+            if (healed.touched()) {
+                RewindLog.LOGGER.info("Rewind: startup self-healing: {}", healed);
+            }
+        } catch (Throwable t) {
+            RewindLog.LOGGER.warn("Rewind: startup self-healing failed", t);
+        }
     }
 
     private RewindState() {

@@ -24,12 +24,10 @@ stonecutter {
         /**
          * One node per supported (Minecraft version, loader) pair.
          *
-         * Layout note: each node keeps its FULL sources under
-         * `versions/<project>/src` (moved verbatim from the old
-         * `targets/<loader>-<mc>/src`). The shared root `src/` is
-         * intentionally empty, so Stonecutter preprocessing is a no-op
-         * and no `//?` merging was needed. This keeps the git diff to
-         * pure renames plus build files.
+         * Layout note: shared code lives in the root `src/` and uses
+         * Stonecutter `//?` preprocessing (`//? if fabric/forge/neoforge`,
+         * version checks); loader-specific code that cannot be unified
+         * stays under `versions/<project>/src`.
          */
         fun match(project: String, vararg loaders: String, version: String = project) {
             for (loader in loaders) version("$project-$loader", version).buildscript("build.$loader.gradle.kts")

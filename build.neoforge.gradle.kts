@@ -54,6 +54,9 @@ repositories {
             includeGroup("curse.maven")
         }
     }
+    // zstd-jni（纯库）：JarJar 内嵌用。有网走中央库；本机 ~/.m2 有就近用。
+    mavenLocal()
+    mavenCentral()
 }
 
 dependencies {
@@ -69,6 +72,10 @@ dependencies {
         add("additionalRuntimeClasspath", project(":common"))
     }
     implementation(prop("deps.aui"))
+    // TODO2 Phase2 P0：zstd-jni 是纯库（非模组），必须 JarJar 进发行 jar——
+    // 发行 jar 只拷 common 的类，不带它的外部依赖；不内嵌则生产环境静默退化成 Deflate。
+    // metadata 里不声明它（它不是模组，玩家无需另装）。
+    add("jarJar", "com.github.luben:zstd-jni:${prop("deps.zstd")}")
 }
 
 tasks {

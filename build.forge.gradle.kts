@@ -13,8 +13,8 @@ import org.gradle.api.tasks.SourceSetContainer
 
 fun prop(key: String): String = sc.properties[key]
 
-// Common must be evaluated first so its `sourceSets` exist when the jar below
-// pulls in the shared classes.
+// Common must be evaluated first so its `sourceSets` exist when the jar pulls
+// in the shared classes.
 evaluationDependsOn(":common")
 
 group = prop("mod.group")
@@ -48,16 +48,25 @@ legacyForge {
 
 repositories {
     maven("https://maven.sighs.cc/repository/maven-public/")
+    mavenLocal()
     mavenCentral()
 }
 
 dependencies {
     implementation(project(":common"))
+    // Dev runs use FML's legacy classpath like NeoForge 1.21.1: only the `mods`
+    // sourceSet output reaches MOD_CLASSES, so the shared common project must be
+    // added explicitly, or dev fails with NoClassDefFoundError for common classes.
+    add("additionalRuntimeClasspath", project(":common"))
     // AUI ships SRG names (1.20.1 methods/fields are m_xxx_/f_xxx_) while dev
     // runs named mappings, so mod jars must go through the remapping
     // `modImplementation` configuration. Plain `implementation` would neither
     // remap nor apply, ending in NoSuchMethodError at dev runtime.
     add("modImplementation", prop("deps.aui"))
+    // TODO2 Phase2 P0：zstd-jni 是纯库（非模组），必须 JarJar 进发行 jar——
+    // 发行 jar 只含本模组类，不带外部依赖；不内嵌则生产环境静默退化成 Deflate。
+    // metadata 里不声明它（它不是模组，玩家无需另装）。
+    add("jarJar", "com.github.luben:zstd-jni:${prop("deps.zstd")}")
     // The Mixin annotation processor must be explicit: the java plugin puts
     // `-processorpath` on this configuration, otherwise no refmap is
     // generated and reobfJar fails for missing mappings.
@@ -113,7 +122,7 @@ tasks {
             attributes("MixinConfigs" to "rewind.mixins.json,rewind.client.mixins.json")
         }
         // Shared common classes go into the final jar (dev runs resolve them
-        // via the project dependency above).
+        // via additionalRuntimeClasspath above).
         from(project(":common").extensions.getByType<SourceSetContainer>()["main"].output.classesDirs)
         val name = prop("mod.id")
         inputs.property("mod_id", name)

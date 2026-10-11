@@ -61,11 +61,21 @@ public final class RollbackSettings {
      */
     public static final boolean DEFAULT_IN_PLACE_ROLLBACK = true;
 
+    /**
+     * 建点/回溯跳过非 NBT/MCA 文件（`advancements/`、`stats/`、`icon.png`；`.mcc` 算 MCA 一边）。
+     *
+     * <p>默认 {@code false}：走原路径，这些文件和其他文件一样进存档点、跟着回滚。
+     * 开着则存档点操作（建点、回滚、离线修复、列举）统一看不到它们，磁盘上的原文件原地保留、不碰；
+     * 原版游戏自己的读写照常运行。`playerdata/` 的 NBT、`datapacks/`、`serverconfig/` 不在范围内，照常备份。
+     */
+    public static final boolean DEFAULT_SKIP_NON_NBT_MCA = false;
+
     private static volatile boolean syncRecipeBook = DEFAULT_SYNC_RECIPE_BOOK;
     private static volatile boolean syncChunksNearPlayer = DEFAULT_SYNC_CHUNKS_NEAR_PLAYER;
     private static volatile int cooldownSeconds = DEFAULT_COOLDOWN_SECONDS;
     private static volatile boolean rollbackOnDeath = DEFAULT_ROLLBACK_ON_DEATH;
     private static volatile boolean inPlaceRollback = DEFAULT_IN_PLACE_ROLLBACK;
+    private static volatile boolean skipNonNbtMca = DEFAULT_SKIP_NON_NBT_MCA;
 
     private RollbackSettings() {
     }
@@ -100,14 +110,20 @@ public final class RollbackSettings {
         return inPlaceRollback;
     }
 
+    /** 建点/回溯要不要跳过非 NBT/MCA 文件。 */
+    public static boolean skipNonNbtMca() {
+        return skipNonNbtMca;
+    }
+
     /** 配置加载 / 重载时把值抄进来。 */
     public static void apply(boolean recipeBook, boolean chunksNearPlayer, int cooldownSeconds, boolean rollbackOnDeath,
-            boolean inPlaceRollback) {
+            boolean inPlaceRollback, boolean skipNonNbtMca) {
         syncRecipeBook = recipeBook;
         syncChunksNearPlayer = chunksNearPlayer;
         setCooldownSeconds(cooldownSeconds);
         RollbackSettings.rollbackOnDeath = rollbackOnDeath;
         RollbackSettings.inPlaceRollback = inPlaceRollback;
+        RollbackSettings.skipNonNbtMca = skipNonNbtMca;
     }
 
     /** 改配方书开关（只改内存；落盘由平台配置层负责）。 */
@@ -128,6 +144,11 @@ public final class RollbackSettings {
     /** 改「原地回滚」开关（只改内存；落盘由平台配置层负责）。 */
     public static void setInPlaceRollback(boolean value) {
         inPlaceRollback = value;
+    }
+
+    /** 改「跳过非 NBT/MCA」开关（只改内存；落盘由平台配置层负责）。 */
+    public static void setSkipNonNbtMca(boolean value) {
+        skipNonNbtMca = value;
     }
 
     /**

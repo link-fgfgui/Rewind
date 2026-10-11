@@ -7,6 +7,7 @@ import cc.sighs.rewind.server.ForgeRewindPlatform;
 import cc.sighs.rewind.server.RewindServerConfig;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
@@ -52,5 +53,8 @@ public final class RewindForge {
         }
         // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
         MinecraftForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> RewindState.onWorldUnloaded());
+        // 启动自愈（TODO2 §4.2）：开服读完关卡即检查 GC 崩溃窗口，比任何建点/回滚都早。
+        MinecraftForge.EVENT_BUS.addListener(
+                (ServerStartedEvent event) -> RewindState.onServerStarted(event.getServer()));
     }
 }

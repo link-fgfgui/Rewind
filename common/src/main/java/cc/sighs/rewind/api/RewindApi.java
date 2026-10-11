@@ -243,10 +243,29 @@ public final class RewindApi {
         return RewindPlatforms.require().worldRoot(server);
     }
 
-    /** 这个槽位有没有一个完整的存档点可还原。 */
+    /** 这个槽位有没有一个完整的存档点可还原（墓碑槽位不可还原，UI 直接隐藏）。 */
     public static boolean hasCheckpoint(Path worldRoot, String slot) {
         SnapshotMeta meta = describe(worldRoot, slot);
-        return meta != null && meta.isComplete();
+        return meta != null && meta.isRestorable();
+    }
+
+    /** 该槽位是否为墓碑（游戏内软删除，仅标记隐藏，父子链不断）。 */
+    public static boolean isTombstoned(Path worldRoot, String slot) {
+        SnapshotMeta meta = describe(worldRoot, slot);
+        return meta != null && meta.tombstone;
+    }
+
+    /** 取消软删除（清墓碑标记，物理文件本就没动）。 */
+    public static boolean restoreCheckpoint(Path worldRoot, String slot) {
+        if (!SnapshotLayout.isValidSlotName(slot)) {
+            return false;
+        }
+        try {
+            return cc.sighs.rewind.common.store.SnapshotStore.restore(worldRoot, slot);
+        } catch (IOException e) {
+            RewindLog.LOGGER.error("Rewind: failed to restore checkpoint {}", slot, e);
+            return false;
+        }
     }
 
     /** 槽位的元数据；不存在时返回 null。 */
@@ -329,13 +348,13 @@ public final class RewindApi {
         try {
             SnapshotIndex index = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
             SnapshotMeta head = index.get(index.getHead());
-            if (head != null && head.isComplete()) {
+            if (head != null && head.isRestorable()) {
                 return head.slot;
             }
             SnapshotMeta newest = null;
             for (String slot : index.slots()) {
                 SnapshotMeta meta = index.get(slot);
-                if (meta == null || !meta.isComplete()) {
+                if (meta == null || !meta.isRestorable()) {
                     continue;
                 }
                 if (newest == null || meta.savedAtMillis > newest.savedAtMillis) {
@@ -357,12 +376,12 @@ public final class RewindApi {
     // ------------------------------------------------------------------ 槽位管理（纯文件操作）
 
     /**
-     * 删除一个槽位：目录、清单、背包快照、索引条目。
+     * 删除一个槽位（TODO2 Phase2 §3.3：纯软删除 Tombstone，毫秒级、不断链）。
      *
      * <p>纯文件操作，任意线程可调；但**不要在存档点操作进行中调用**（{@link #isBusy()}），
-     * 两边都会写同一张索引。
+     * 两边都会写同一张索引。物理释放由离线 GC 整树重烘焙完成。
      *
-     * @return 是否真的删掉了东西
+     * @return 是否真的标记了东西
      */
     public static boolean deleteCheckpoint(Path worldRoot, String slot) {
         if (!SnapshotLayout.isValidSlotName(slot)) {

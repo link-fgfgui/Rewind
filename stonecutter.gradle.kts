@@ -3,8 +3,8 @@ plugins {
 }
 
 // Active node for editing and `runClient`/`runServer`. The 1.21.1 NeoForge
-// node is the primary dev target. Full-copy layout: switching active only
-// changes which `versions/<project>` compiles the shared (empty) root `src/`.
+// node is the primary dev target. Shared code in the root `src/` is preprocessed
+// with `//?` conditionals per active node.
 stonecutter active "1.21.1-neoforge"
 
 // See https://stonecutter.kikugie.dev/wiki/config/params

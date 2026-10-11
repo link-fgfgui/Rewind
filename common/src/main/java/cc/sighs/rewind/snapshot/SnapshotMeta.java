@@ -36,9 +36,19 @@ public final class SnapshotMeta {
     public double playerZ;
     public int fileCount;
     public long totalBytes;
+    /**
+     * 游戏内软删除墓碑（TODO2 Phase2 §3.3）：true = 已在游戏内点删除，仅标记隐藏，
+     * 物理文件保留、父子引用链不断。离线 GC 重烘焙时才真正释放空间。
+     */
+    public boolean tombstone;
 
     public boolean isComplete() {
         return SnapshotLayout.STATUS_COMPLETE.equals(status);
+    }
+
+    /** 可还原 = 完整且非墓碑（UI 过滤与回滚入口共用）。 */
+    public boolean isRestorable() {
+        return isComplete() && !tombstone;
     }
 
     public SnapshotMeta copy() {
@@ -60,6 +70,7 @@ public final class SnapshotMeta {
         meta.playerZ = playerZ;
         meta.fileCount = fileCount;
         meta.totalBytes = totalBytes;
+        meta.tombstone = tombstone;
         return meta;
     }
 

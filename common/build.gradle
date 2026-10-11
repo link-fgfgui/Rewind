@@ -11,12 +11,16 @@ java {
 }
 
 repositories {
+    mavenLocal()
     mavenCentral()
 }
 
 dependencies {
     // 日志门面：common 只依赖 org.slf4j.Logger，具体后端由各 target 运行时（Minecraft）提供。
     implementation 'org.slf4j:slf4j-api:1.7.36'
+    // Zstd 字典差分运行库：C 原生高吞吐 + loadDictionary 差分（TODO2 Phase2 P0）。
+    // common 仍保持 Java 8 兼容、无 Minecraft 依赖；zstd-jni 为纯 Maven 中央库。
+    implementation 'com.github.luben:zstd-jni:1.5.7-11'
     // @Nullable 等空值注解，仅编译期需要，不打进产物。
     compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
 

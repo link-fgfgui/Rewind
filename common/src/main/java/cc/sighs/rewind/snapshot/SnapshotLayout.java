@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.regex.Pattern;
+import cc.sighs.rewind.common.config.RollbackSettings;
 import cc.sighs.rewind.common.config.SlotSettings;
 
 /**
@@ -24,6 +25,12 @@ public final class SnapshotLayout {
     public static final String MANIFEST_SUFFIX = ".manifest";
     /** 槽位块映射文件后缀：按 4 KiB 块存储的文件每个一行（见 {@code SnapshotBlocks}）。 */
     public static final String BLOCK_MAP_SUFFIX = ".blocks";
+    /** 槽位增量包后缀：TODO2 Phase2 全域 NBT Zstd 字典差分（见 {@code ZPack}）。 */
+    public static final String ZPACK_SUFFIX = ".zpack";
+    /** GC 临时工作区目录名（世界根下，与 rewind_snapshots 同级）。 */
+    public static final String COMPACT_TMP_NAME = ".compact_tmp";
+    /** GC 让位目录名（世界根下，与 rewind_snapshots 同级）。 */
+    public static final String COMPACT_OLD_NAME = ".compact_old";
     /** 共享块目录名，位于存档点根目录内：内容寻址的 4 KiB 块，所有槽位共用。 */
     public static final String BLOCKS_DIR_NAME = "blocks";
     /** 槽位背包快照后缀，位于存档点根目录内、与槽位目录同级（不参与镜像）。 */
@@ -62,6 +69,12 @@ public final class SnapshotLayout {
     private static final String PLAYER_DATA_DIR = "playerdata";
     /** 玩家数据目录（26.1 起搬到这里，见 {@code LevelResource.PLAYER_DATA_DIR}）。 */
     private static final String PLAYERS_DATA_DIR = "players/data";
+    /** 进度目录（per-player JSON，原版 GSON 直写）。 */
+    private static final String ADVANCEMENTS_DIR = "advancements";
+    /** 统计目录（per-player JSON，Commons IO 直写）。 */
+    private static final String STATS_DIR = "stats";
+    /** 存档图标（世界选择界面那张图，PNG）。 */
+    private static final String ICON_FILE_NAME = "icon.png";
 
     /** 根目录下 {@code level<随机数字>.dat}，level.dat 写入时的临时文件。 */
     private static final Pattern ROOT_LEVEL_TEMP = Pattern.compile("level\\d+\\.dat");
@@ -109,6 +122,21 @@ public final class SnapshotLayout {
     /** 槽位的背包快照文件（与槽位目录同级，不参与镜像，删槽位时要一起删）。 */
     public static Path inventoryFile(Path worldRoot, String slot) {
         return snapshotRoot(worldRoot).resolve(slot + INVENTORY_SUFFIX);
+    }
+
+    /** 槽位的增量包文件（TODO2 Phase2：与槽位目录同级，不参与镜像）。 */
+    public static Path zpackFile(Path worldRoot, String slot) {
+        return snapshotRoot(worldRoot).resolve(slot + ZPACK_SUFFIX);
+    }
+
+    /** GC 临时工作区（世界根下，与 rewind_snapshots 同级）。 */
+    public static Path compactTmpDir(Path worldRoot) {
+        return worldRoot.resolve(COMPACT_TMP_NAME);
+    }
+
+    /** GC 让位目录（世界根下，与 rewind_snapshots 同级）。 */
+    public static Path compactOldDir(Path worldRoot) {
+        return worldRoot.resolve(COMPACT_OLD_NAME);
     }
 
     /** 第 {@code index} 个手动槽位的 id（{@code index} 从 1 开始），形如 {@code s1}。 */
@@ -201,7 +229,8 @@ public final class SnapshotLayout {
      * 判断一个相对路径是否应该被排除。
      *
      * <p>排除 {@code session.lock}、存档点目录自身，以及原版与 Rewind 自己写盘留下的临时文件；
-     * 其余（含 .mcc 超大区块文件、datapacks/、advancements/、stats/ 等）都算存档状态。
+     * 其余（含 .mcc 超大区块文件、datapacks/、`serverconfig/` 等）都算存档状态。`advancements/`、
+     * `stats/` 与 `icon.png` 只有 `rollback.skipNonNbtMca` 开着才排除（见 {@link RollbackSettings}）。
      */
     public static boolean isExcluded(String relativePath) {
         String path = normalize(relativePath);
@@ -232,6 +261,11 @@ public final class SnapshotLayout {
         }
         if ((first.equals(PLAYER_DATA_DIR) || path.startsWith(PLAYERS_DATA_DIR + "/"))
                 && PLAYER_DATA_TEMP.matcher(last).matches()) {
+            return true;
+        }
+        if (RollbackSettings.skipNonNbtMca()
+                && (first.equals(ADVANCEMENTS_DIR) || first.equals(STATS_DIR)
+                        || path.equals(ICON_FILE_NAME))) {
             return true;
         }
         return false;

@@ -11,6 +11,7 @@ import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLEnvironment;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 
 @Mod(RewindNeoForge121.MOD_ID)
@@ -31,5 +32,8 @@ public final class RewindNeoForge121 {
         // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
         // 新世界从干净账本起步；槽位块映射在盘上，首建点照常走增量（journal 为空即全沿用 + 松散镜像）。
         NeoForge.EVENT_BUS.addListener(ServerStoppedEvent.class, event -> RewindState.onWorldUnloaded());
+        // 启动自愈（TODO2 §4.2）：开服读完关卡即检查 GC 崩溃窗口，比任何建点/回滚都早。
+        NeoForge.EVENT_BUS.addListener(ServerStartedEvent.class,
+                event -> RewindState.onServerStarted(event.getServer()));
     }
 }

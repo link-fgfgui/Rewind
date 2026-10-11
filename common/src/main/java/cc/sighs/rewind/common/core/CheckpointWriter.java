@@ -34,6 +34,9 @@ import cc.sighs.rewind.snapshot.SnapshotLayout;
 import cc.sighs.rewind.snapshot.SnapshotManifest;
 import cc.sighs.rewind.snapshot.SnapshotMeta;
 import cc.sighs.rewind.snapshot.SnapshotMirror;
+import cc.sighs.rewind.snapshot.ZPackCheckpoint;
+import cc.sighs.rewind.snapshot.ZPackOffline;
+import cc.sighs.rewind.snapshot.ZstdDelta;
 
 /**
  * 存档点的磁盘机制：把世界强制落盘后镜像进槽位，以及把槽位镜像回活动存档。
@@ -107,6 +110,8 @@ public final class CheckpointWriter {
         }
         // 时间线：新节点挂在建点这一刻世界所在的节点下面
         base.parentSlot = parentFor(index, slot, previous);
+        // 覆盖墓碑槽位即复活：新存档点永远是存活节点（墓碑不继承）
+        base.tombstone = false;
 
         SnapshotMeta incomplete = base.copy();
         incomplete.status = SnapshotLayout.STATUS_INCOMPLETE;
@@ -132,6 +137,19 @@ public final class CheckpointWriter {
         }
         // 映射必须等块落盘之后再写：先写映射、崩在落盘之前，会留下指向不存在块的槽位（读不回来）
         blocks.save();
+
+        // TODO2 Phase2 §3.1：附加式 zpack 写包（变更集相对父槽位的字典差分）。
+        // 失败只记日志：块存储仍是权威源，回滚自动退回旧路。必须在清账本之前写。
+        try {
+            ZPackCheckpoint.Written zpack = ZPackCheckpoint.writeSlotZpack(world, slot, base.parentSlot,
+                    RewindState.storageJournal().entries(), mirror.files,
+                    SnapshotLayout.slotDir(world, slot), platform);
+            RewindLog.LOGGER.info("Rewind: zpack {} written ({} entries, {} payload bytes, {})",
+                    slot, zpack.entries, zpack.payloadBytes,
+                    ZstdDelta.isAvailable() ? "zstd-native" : "deflate-fallback");
+        } catch (Throwable t) {
+            RewindLog.LOGGER.warn("Rewind: zpack for {} not written, block store remains authoritative", slot, t);
+        }
 
         SnapshotMeta complete = base.copy();
         complete.status = SnapshotLayout.STATUS_COMPLETE;
@@ -159,6 +177,10 @@ public final class CheckpointWriter {
      * <p>「关世界 → 覆盖 → 重开」那条回退路径用它（那时候世界已经关了，内存里没有东西要同步）；
      * 原地回滚有自己的回拷逻辑，不走这里。
      *
+     * <p>写盘二选一（TODO2 Phase2 §4.3）：有完整 zpack 链时走纯 NBT 重建
+     * （链 → {@code AnvilPacker} 装配 {@code .mca}，raw 重新 gzip 落 {@code .dat}，
+     * 不盲写扇区二进制块）；不适用或重建失败回退块存储旧路。旧路完备，回退永远安全。
+     *
      * <p>回拷完顺手通知一遍「模组侧的解码缓存」（见 {@link SophisticatedCoreCompat}）：那条路径会把世界
      * 重新开起来，模组跟着重载走一遍，但它们自己缓存的解码结果不归世界生命周期管，同一进程里还会被复用。
      */
@@ -170,7 +192,18 @@ public final class CheckpointWriter {
         }
         // 用建点时记录的清单判断活动存档里哪些文件还是原样：没动过的不必回拷
         SnapshotManifest reference = SnapshotManifest.load(SnapshotLayout.manifestFile(worldRoot, slot));
-        SnapshotMirror.Result mirror = SnapshotBlockIo.restoreInto(worldRoot, slot, reference);
+        SnapshotMirror.Result mirror = null;
+        try {
+            mirror = ZPackOffline.rebuild(worldRoot, slot, ZPackOffline.installedLayout());
+        } catch (Throwable t) {
+            RewindLog.LOGGER.warn("Rewind: pure-NBT rebuild of {} failed, falling back to block store", slot, t);
+            mirror = null;
+        }
+        if (mirror != null) {
+            RewindLog.LOGGER.info("Rewind: restored slot {} via pure-NBT rebuild", slot);
+        } else {
+            mirror = SnapshotBlockIo.restoreInto(worldRoot, slot, reference);
+        }
         long millis = millisSince(startedNanos);
         RewindLog.LOGGER.info("Rewind: restored slot {} into {} ({}) in {} ms", slot, worldRoot, mirror.summary(), millis);
         SophisticatedCoreCompat.clearCaches();

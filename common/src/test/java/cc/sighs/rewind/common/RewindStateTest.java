@@ -1,14 +1,21 @@
 package cc.sighs.rewind.common;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import cc.sighs.rewind.common.spi.StorageKind;
+import cc.sighs.rewind.common.spi.RewindPlatform;
+import cc.sighs.rewind.common.spi.RewindPlatforms;
+import cc.sighs.rewind.snapshot.SnapshotLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * {@link RewindState} 覆盖层状态机：武装 / 撤装 / 清账本。
@@ -80,5 +87,83 @@ class RewindStateTest {
         assertEquals(0, RewindState.coldBaselines().size());
         assertSame(base, RewindState.frozenBase(StorageKind.CHUNK, "minecraft:overworld", POS));
         RewindState.frozenBases().clear();
+    }
+
+    @TempDir
+    Path worldRoot;
+
+    /**
+     * 开服自愈（TODO2 §4.2）：直接进世界不经过修复屏时，靠开服事件这一次把 6a 中继
+     * 状态搬回来——平台桩只给世界根，不碰任何 Minecraft 类型。
+     */
+    @Test
+    void serverStartedHealsRelayWindow() throws Exception {
+        Path oldDir = SnapshotLayout.compactOldDir(worldRoot);
+        Files.createDirectories(oldDir);
+        byte[] pack = {(byte) 0x52, (byte) 0x57, (byte) 0x5A, (byte) 0x50};
+        Files.write(oldDir.resolve("quick.zpack"), pack);
+        RewindPlatform stub = new RewindPlatform() {
+            @Override
+            public String modVersion() {
+                return "test";
+            }
+
+            @Override
+            public Path worldRoot(Object server) {
+                return worldRoot;
+            }
+
+            @Override
+            public boolean isSameThread(Object server) {
+                return true;
+            }
+
+            @Override
+            public boolean isDedicatedServer(Object server) {
+                return false;
+            }
+
+            @Override
+            public boolean isPublished(Object server) {
+                return false;
+            }
+
+            @Override
+            public boolean hasPlayers(Object server) {
+                return false;
+            }
+
+            @Override
+            public cc.sighs.rewind.common.spi.FlushOutcome flushForCheckpoint(Object server, String slot,
+                    String source) {
+                return null;
+            }
+
+            @Override
+            public boolean supportsInPlaceRollback() {
+                return false;
+            }
+
+            @Override
+            public cc.sighs.rewind.common.spi.RollbackOutcome rollbackInPlace(Object server, Path worldRoot,
+                    String slot) {
+                return null;
+            }
+
+            @Override
+            public ClassLoader modClassLoader(String modId) {
+                return null;
+            }
+        };
+        RewindPlatforms.install(stub);
+        try {
+            // server 对象原样透传（common 不解读）：传个哑对象即可
+            RewindState.onServerStarted(new Object());
+        } finally {
+            RewindPlatforms.install(null);
+        }
+        assertTrue(Files.isDirectory(SnapshotLayout.snapshotRoot(worldRoot)));
+        assertArrayEquals(pack, Files.readAllBytes(
+                SnapshotLayout.snapshotRoot(worldRoot).resolve("quick.zpack")));
     }
 }

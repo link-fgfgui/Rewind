@@ -40,6 +40,8 @@ import cc.sighs.rewind.snapshot.SnapshotBlockStore;
 import cc.sighs.rewind.snapshot.SnapshotChunkDecoder;
 import cc.sighs.rewind.snapshot.SnapshotBlocks;
 import cc.sighs.rewind.snapshot.SnapshotLayout;
+import cc.sighs.rewind.snapshot.ZPack;
+import cc.sighs.rewind.snapshot.ZPackCheckpoint;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
@@ -188,6 +190,8 @@ public final class InPlaceRollback {
         public long forceDirtyMs;
         /** 覆盖层：灌装成功的区块数。 */
         public int coverPopulated;
+        /** 覆盖层：其中走 zpack 快路的条目数（余下走块存储旧路/冻结基底，上机验收对账用）。 */
+        public int coverZpack;
         /** 覆盖层：灌装耗时。 */
         public long coverMs;
         /** 覆盖层：重载命中的读次数。 */
@@ -290,13 +294,13 @@ public final class InPlaceRollback {
             stepNanos = System.nanoTime();
             List<String> dataFiles;
             try (SnapshotBlockStore coverStore = SnapshotBlockIo.openStore(worldRoot)) {
-                dataFiles = populateCover(server, slotDir, snapshotBlocks, coverStore, targets, result);
+                dataFiles = populateCover(server, worldRoot, slot, slotDir, snapshotBlocks, coverStore, targets, result);
                 coveredChunks = result.coverPopulated;
             }
             result.coverMs = millisSince(stepNanos);
             RewindState.armStorageCover();
-            Rewind.LOGGER.info("Rewind: storage cover populated ({} chunks) in {} ms",
-                    coveredChunks, result.coverMs);
+            Rewind.LOGGER.info("Rewind: storage cover populated ({} chunks, {} via zpack) in {} ms",
+                    coveredChunks, result.coverZpack, result.coverMs);
 
             stepNanos = System.nanoTime();
             recreateHolders(server, targets, result);
@@ -472,9 +476,15 @@ public final class InPlaceRollback {
     /**
      * 内存直解灌装：把受影响区块的检查点数据从快照直接解进账本。
      *
-     * <p>对 {@code /saves} 活文件 <b>0 读取</b>：区块扇区走快照块存储（
-     * {@code SnapshotChunkDecoder}，严格按 5 字节头截断与版本分派，含 {@code .mcc}
-     * 外溢），写前冻结基底优先（冷区块快照数据，未进块存储的不走解码），
+     * <p>数据源二选一（对 {@code /saves} 活文件 <b>0 读取</b>）：
+     * <ol>
+     *   <li><b>zpack 快路</b>（TODO2 Phase2）：该槽位有 {@code <slot>.zpack} 时一次解出全量表，
+     *       命中即喂账本（空 raw=删除标记）；未命中或解码失败回退第 2 条——“zpack 里没有”
+     *       永不等价于删除（链上可能有洞：老槽位无包、建点时个别编不出）。</li>
+     *   <li><b>块存储旧路</b>：区块扇区走快照块存储（{@code SnapshotChunkDecoder}，
+     *       严格按 5 字节头截断与版本分派，含 {@code .mcc} 外溢）。</li>
+     * </ol>
+     * 写前冻结基底优先（冷区块快照数据，未进块存储的不走解码），
      * 存档数据/玩家数据走槽位目录的 {@code .dat}（快照目录，允许）。
      * 老格式槽位（整文件、无块映射）回退读槽位整文件——同样是快照目录，不碰活文件。
      * 快照里不存在的区块记删除标记：读拦截短路喂空，不放行走盘（否则把删掉的区块复活）。
@@ -482,12 +492,22 @@ public final class InPlaceRollback {
      *
      * @return 本次覆盖到的存档数据文件相对路径（给存档数据回滚打日志用）
      */
-    private static List<String> populateCover(MinecraftServer server, Path slotDir, SnapshotBlocks blocks,
+    private static List<String> populateCover(MinecraftServer server, Path worldRoot, String slot,
+            Path slotDir, SnapshotBlocks blocks,
             SnapshotBlockStore store, List<Target> targets, Result result) {
         int covered = 0;
         List<String> dataFiles = new ArrayList<>();
+        // zpack 全量表：一次解出（无包/链损坏 → null，全员走旧路）。
+        Map<String, byte[]> zpackCover = null;
+        try {
+            zpackCover = ZPackCheckpoint.tryResolve(worldRoot, slot);
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: zpack cover for {} unreadable, falling back to block store", slot, t);
+            zpackCover = null;
+        }
         for (Map.Entry<ServerLevel, List<ChunkPos>> entry : targetsByLevel(targets).entrySet()) {
-            covered += populateCoverForLevel(slotDir, blocks, store, entry.getKey(), entry.getValue());
+            covered += populateCoverForLevel(slotDir, blocks, store, zpackCover, entry.getKey(), entry.getValue(),
+                    result);
         }
         covered += populateDataCover(server, slotDir, dataFiles);
         result.coverPopulated = covered;
@@ -507,7 +527,8 @@ public final class InPlaceRollback {
     }
 
     private static int populateCoverForLevel(Path slotDir, SnapshotBlocks blocks,
-            SnapshotBlockStore store, ServerLevel level, List<ChunkPos> poses) {
+            SnapshotBlockStore store, Map<String, byte[]> zpackCover, ServerLevel level, List<ChunkPos> poses,
+            Result result) {
         ForgeRewindPlatform platform = new ForgeRewindPlatform();
         String dimensionId = level.dimension().location().toString();
         int covered = 0;
@@ -520,8 +541,8 @@ public final class InPlaceRollback {
                 continue;
             }
             for (ChunkPos pos : poses) {
-                if (populateCoverForChunk(slotDir, blocks, store, platform,
-                        dir, kind, dimensionId, pos)) {
+                if (populateCoverForChunk(slotDir, blocks, store, zpackCover, platform,
+                        dir, kind, dimensionId, pos, result)) {
                     covered++;
                 }
             }
@@ -530,13 +551,36 @@ public final class InPlaceRollback {
     }
 
     private static boolean populateCoverForChunk(Path slotDir, SnapshotBlocks blocks,
-            SnapshotBlockStore store, ForgeRewindPlatform platform,
-            String dir, StorageKind kind, String dimensionId, ChunkPos pos) {
+            SnapshotBlockStore store, Map<String, byte[]> zpackCover, ForgeRewindPlatform platform,
+            String dir, StorageKind kind, String dimensionId, ChunkPos pos, Result result) {
         // 写前冻结优先：冷区块在建点后第一次被改写前留下的基底，本身就是快照数据
         Object frozen = RewindState.frozenBase(kind, dimensionId, pos.toLong());
         if (frozen instanceof CompoundTag) {
             RewindState.storageJournal().onWritten(kind, dimensionId, pos.toLong(), ((CompoundTag) frozen).copy());
             return true;
+        }
+        // zpack 快路：命中即喂账本；未命中/解码失败一律回退旧路（链洞≠删除）。
+        if (zpackCover != null) {
+            String key = ZPack.keyOf(ZPackCheckpoint.kindToType(kind), dimensionId, pos.toLong());
+            if (zpackCover.containsKey(key)) {
+                try {
+                    byte[] raw = zpackCover.get(key);
+                    if (raw == null || raw.length == 0) {
+                        RewindState.storageJournal().onWritten(kind, dimensionId, pos.toLong(), null);
+                        result.coverZpack++;
+                        return true;
+                    }
+                    Object tag = platform.decodeChunkSector(raw);
+                    if (tag != null) {
+                        RewindState.storageJournal().onWritten(kind, dimensionId, pos.toLong(), tag);
+                        result.coverZpack++;
+                        return true;
+                    }
+                    Rewind.LOGGER.warn("Rewind: zpack entry {} undecodable, falling back to block store", key);
+                } catch (Throwable t) {
+                    Rewind.LOGGER.warn("Rewind: zpack entry {} failed, falling back to block store", key, t);
+                }
+            }
         }
         String mcaRelative = SnapshotLayout.normalize(dir + "/" + regionFileName(pos));
         try {

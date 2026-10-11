@@ -35,6 +35,7 @@ public final class SnapshotUsage {
             total += sizeOf(SnapshotLayout.manifestFile(worldRoot, slot));
             total += sizeOf(SnapshotLayout.blockMapFile(worldRoot, slot));
             total += sizeOf(SnapshotLayout.inventoryFile(worldRoot, slot));
+            total += sizeOf(SnapshotLayout.zpackFile(worldRoot, slot));
             occupied.put(slot, total);
         }
         return occupied;
