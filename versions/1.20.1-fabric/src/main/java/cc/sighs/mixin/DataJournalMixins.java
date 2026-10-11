@@ -1,6 +1,8 @@
 package cc.sighs.mixin;
 
 import java.io.File;
+import java.util.Map;
+import java.util.function.Function;
 import cc.sighs.mixin.RollbackAccessMixins.DimensionDataStorageAccess;
 import cc.sighs.rewind.common.RewindState;
 import net.minecraft.nbt.CompoundTag;
@@ -29,17 +31,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  *       NBT 副本在返回前于调用线程同步获取。实现是“再调一次”
  *       {@code save(CompoundTag)}——要求实现是纯写函数（1.20.1 的签名是单参数的，
  *       没有 {@code HolderLookup.Provider}）；取到即拷走，原版随后照常走自己的那份。</li>
+ *   <li>{@code DimensionDataStorage.get(Function, String)}：**必须挂这一层**——原版
+ *       {@code readSavedData} 先做 {@code if (file1.exists())} 预检，快照有而盘上无文件时
+ *       提前返回 null，底层 {@code readTagFromDisk} 根本不会触发。命中时喂快照拷贝、
+ *       用传入的 factory 反序列化（1.20.1 是 {@code Function<CompoundTag,T>}，
+ *       {@code DimensionDataStorage} 没有 {@code registries} 字段）并把实例回填缓存。</li>
  *   <li>{@code DimensionDataStorage.readTagFromDisk(String,int)}：
- *       1.20.1 的 {@code get(Function,String)} → {@code readSavedData} →
- *       {@code readTagFromDisk} 是一条单漏斗（{@code readSavedData} 抓 {@code Exception}
- *       返回 null），所以只拦这一层就够了：命中喂快照拷贝，反序列化交给原版自己的
- *       factory（1.20.1 的 factory 是 {@code Function<CompoundTag,T>}，不需要 registries——
- *       1.20.1 的 {@code DimensionDataStorage} 根本没有 {@code registries} 字段，
- *       这里不做反序列化）。{@code LegacyStructureDataHandler} 直接调底层，
- *       挂这里与它同构、无干扰。</li>
+ *       底层直读同样短路（防已有实例绕过 {@code get} 直接调它，如
+ *       {@code LegacyStructureDataHandler}）：命中喂快照拷贝；删除标记抛
+ *       {@code IOException}（上层 {@code readSavedData} 抓到后按“文件不存在”处理，
+ *       与它同构；<b>严禁包成 RuntimeException</b>，{@code LegacyStructureDataHandler}
+ *       只抓 {@code IOException}）。</li>
  *   <li>{@code PlayerDataStorage.save(Player):33} 同步写：调用线程直接拿到 NBT 引用，
  *       拷一份即走。{@code load(Player)} 读拦截喂快照（1.20.1 的返回是
- *       {@code CompoundTag}、缺席即 null，所以删除标记喂 null 即“不存在”语义）。</li>
+ *       {@code CompoundTag}、缺席即 null，删除标记喂 null 即“不存在”语义；原版内部会调
+ *       {@code player.load}，短路时一并补上）。</li>
  * </ul>
  *
  * <p>没有 level.dat 写监听：1.20.1 的 {@code LevelStorageAccess} 里不存在私有的
@@ -88,24 +94,60 @@ public final class DataJournalMixins {
     }
 
     /**
-     * 存档数据读拦截：在唯一的磁盘漏斗处短路，命中喂快照拷贝。
+     * 存档数据读拦截：高层与底层两个入口都短路，命中喂快照。
      *
-     * <p>反序列化交给原版 {@code readSavedData} 自己的 factory（单参数
-     * {@code Function<CompoundTag,T>}，无 registries 依赖）；删除标记抛
-     * {@code IOException}（上层 {@code readSavedData} 抓到后返回 null，
-     * 与“文件不存在”同构，顺带把缓存记成“无”）。
+     * <p>高层 {@code get(Function, String)} 挂在磁盘预检之前——快照有但盘上无文件时，
+     * 原版 {@code readSavedData} 会因 {@code file1.exists() == false} 提前返回 null、
+     * 底层根本不触发，只挂底层会漏掉这类快照数据（1.20.1-forge 同款挂法）。
+     * 反序列化用传进来的单参数 factory（无 registries 依赖），顺手把实例回填缓存
+     * （与原版 {@code get} 的缓存语义一致）。
+     *
+     * <p>底层 {@code readTagFromDisk} 同样短路（防已有实例绕过 {@code get} 直接调它）：
+     * 命中喂快照拷贝；删除标记抛 {@code IOException}（上层 {@code readSavedData} 与
+     * {@code LegacyStructureDataHandler} 都只抓 {@code IOException}，与“文件不存在”同构；
+     * <b>严禁包成 RuntimeException</b>，否则后者抓不住）。
      */
     @Mixin(DimensionDataStorage.class)
     public abstract static class DimensionDataStorageCover {
-        @Inject(method = "readTagFromDisk(Ljava/lang/String;I)Lnet/minecraft/nbt/CompoundTag;",
+        @Inject(method = "get(Ljava/util/function/Function;Ljava/lang/String;)Lnet/minecraft/world/level/saveddata/SavedData;",
                 at = @At("HEAD"),
                 cancellable = true)
-        private void rewind$serveTagFromDisk(String filename, int version,
-                CallbackInfoReturnable<CompoundTag> cir) {
+        private <T extends SavedData> void rewind$serveSavedData(Function<CompoundTag, T> loadFunction,
+                String name, CallbackInfoReturnable<T> cir) {
             try {
                 if (RewindState.isDiscarding() || !RewindState.isStorageCoverArmed()) {
                     return;
                 }
+                DimensionDataStorageAccess access = (DimensionDataStorageAccess) (Object) this;
+                String key = savedataKey(access.rewind$dataFolder(), name);
+                if (!RewindState.dataCover().covers(key)) {
+                    return;
+                }
+                Object tag = RewindState.dataCover().serve(key);
+                Map<String, SavedData> cache = access.rewind$cache();
+                if (tag == null) {
+                    cache.put(name, null);
+                    cir.setReturnValue(null);
+                    return;
+                }
+                CompoundTag full = ((CompoundTag) tag).copy();
+                T instance = loadFunction.apply(full.getCompound("data"));
+                cache.put(name, instance);
+                cir.setReturnValue(instance);
+            } catch (Throwable ignored) {
+                // 拦截失败就当没拦住，走原版读盘
+            }
+        }
+
+        @Inject(method = "readTagFromDisk(Ljava/lang/String;I)Lnet/minecraft/nbt/CompoundTag;",
+                at = @At("HEAD"),
+                cancellable = true)
+        private void rewind$serveTagFromDisk(String filename, int version,
+                CallbackInfoReturnable<CompoundTag> cir) throws java.io.IOException {
+            if (RewindState.isDiscarding() || !RewindState.isStorageCoverArmed()) {
+                return;
+            }
+            try {
                 DimensionDataStorageAccess access = (DimensionDataStorageAccess) (Object) this;
                 String key = savedataKey(access.rewind$dataFolder(), filename);
                 if (!RewindState.dataCover().covers(key)) {
@@ -113,12 +155,12 @@ public final class DataJournalMixins {
                 }
                 Object tag = RewindState.dataCover().serve(key);
                 if (tag == null) {
-                    cir.cancel();
+                    // 不能包成 RuntimeException：LegacyStructureDataHandler 只抓 IOException
                     throw new java.io.IOException("snapshot has no saved data: " + filename);
                 }
                 cir.setReturnValue(((CompoundTag) tag).copy());
             } catch (java.io.IOException e) {
-                throw new RuntimeException(e);
+                throw e;
             } catch (Throwable ignored) {
                 // 非 IO 异常：当没拦住
             }
@@ -156,7 +198,10 @@ public final class DataJournalMixins {
                     cir.setReturnValue(null);
                     return;
                 }
-                cir.setReturnValue(((CompoundTag) tag).copy());
+                CompoundTag copy = ((CompoundTag) tag).copy();
+                // 原版 load 自己调 player.load()：短路时补上，语义一致
+                player.load(copy);
+                cir.setReturnValue(copy);
             } catch (Throwable ignored) {
                 // 拦截失败就当没拦住
             }

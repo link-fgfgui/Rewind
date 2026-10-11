@@ -143,8 +143,9 @@ public final class CheckpointWriter {
         index.setHead(slot);
         index.save(indexFile);
 
-        // 基线前移：写拦截从这里开始重记「相对这个存档点改了什么」，给将来的 collectTargets 用
-        RewindState.clearStorageJournal();
+        // 基线前移：写拦截从这里开始重记「相对这个存档点改了什么」，给将来的 collectTargets 用；
+        // 冻结基底随基线世代一起前移——之前世代的基底内容对应的是建点前那个存档点，回滚到它才允许采纳
+        RewindState.advanceBaseline(slot);
 
         long millis = millisSince(startedNanos);
         RewindLog.LOGGER.info("Rewind: checkpoint {} written ({}) in {} ms", slot, mirror.summary(), millis);

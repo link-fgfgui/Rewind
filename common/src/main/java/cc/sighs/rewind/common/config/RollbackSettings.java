@@ -20,11 +20,14 @@ public final class RollbackSettings {
     /**
      * 回溯时要不要「只同步读回玩家视野内的受影响区块」。
      *
-     * <p>默认 {@code true}：不在任何玩家视野（服务端视距 + 1 个区块）里的受影响区块**不在这里同步读**，
-     * 交给原版流水线按还原后的 ticket 异步读回来。受影响区块的重载实测约 1ms/区块、与「建点之后改了
-     * 多少」成正比，视野外那部分同步等它纯属浪费——玩家看不到，晚几 tick 回来也无所谓。
+     * <p><b>已废弃 / 当前恒被忽略</b>：零磁盘稀疏拦截架构下，覆盖层在回滚收尾撤装时清空，
+     * 延迟加载的区块会错过覆盖、穿透读到盘上的未来数据，所以回滚引擎一律**全部同步读回**
+     * （见各版本 {@code InPlaceRollback.loadChunks}，不再读本开关）。保留这个键只为
+     * 兼容旧配置文件，改它没有任何效果；将来若给延迟加载补上覆盖层驻留，再让它重新生效。
      *
-     * <p>关掉则回到老行为：所有受影响区块都在回滚这一帧里同步读回来（回溯本身更慢，但结束后世界立即完整）。
+     * <p>默认 {@code true}（历史语义）：开启时不在任何玩家视野（服务端视距 + 1 个区块）里的
+     * 受影响区块不在这里同步读，交给原版流水线按还原后的 ticket 异步读回来；
+     * 关闭则所有受影响区块都在回滚这一帧里同步读回来。
      */
     public static final boolean DEFAULT_SYNC_CHUNKS_NEAR_PLAYER = true;
 
@@ -61,11 +64,21 @@ public final class RollbackSettings {
      */
     public static final boolean DEFAULT_IN_PLACE_ROLLBACK = true;
 
+    /**
+     * 建点/回溯跳过非 NBT/MCA 文件（`advancements/`、`stats/`、`icon.png`；`.mcc` 算 MCA 一边）。
+     *
+     * <p>默认 {@code false}：走原路径，这些文件和其他文件一样进存档点、跟着回滚。
+     * 开着则存档点操作（建点、回滚、离线修复、列举）统一看不到它们，磁盘上的原文件原地保留、不碰；
+     * 原版游戏自己的读写照常运行。`playerdata/` 的 NBT、`datapacks/`、`serverconfig/` 不在范围内，照常备份。
+     */
+    public static final boolean DEFAULT_SKIP_NON_NBT_MCA = false;
+
     private static volatile boolean syncRecipeBook = DEFAULT_SYNC_RECIPE_BOOK;
     private static volatile boolean syncChunksNearPlayer = DEFAULT_SYNC_CHUNKS_NEAR_PLAYER;
     private static volatile int cooldownSeconds = DEFAULT_COOLDOWN_SECONDS;
     private static volatile boolean rollbackOnDeath = DEFAULT_ROLLBACK_ON_DEATH;
     private static volatile boolean inPlaceRollback = DEFAULT_IN_PLACE_ROLLBACK;
+    private static volatile boolean skipNonNbtMca = DEFAULT_SKIP_NON_NBT_MCA;
 
     private RollbackSettings() {
     }
@@ -75,7 +88,12 @@ public final class RollbackSettings {
         return syncRecipeBook;
     }
 
-    /** 回溯时是不是只同步读回玩家视野内的受影响区块。 */
+    /**
+     * 回溯时是不是只同步读回玩家视野内的受影响区块。
+     *
+     * <p>已废弃：回滚引擎为了保证覆盖层命中，一律全部同步读回，不再读这个值
+     * （见 {@link #DEFAULT_SYNC_CHUNKS_NEAR_PLAYER}）。
+     */
     public static boolean syncChunksNearPlayer() {
         return syncChunksNearPlayer;
     }
@@ -100,14 +118,20 @@ public final class RollbackSettings {
         return inPlaceRollback;
     }
 
+    /** 建点/回溯要不要跳过非 NBT/MCA 文件。 */
+    public static boolean skipNonNbtMca() {
+        return skipNonNbtMca;
+    }
+
     /** 配置加载 / 重载时把值抄进来。 */
     public static void apply(boolean recipeBook, boolean chunksNearPlayer, int cooldownSeconds, boolean rollbackOnDeath,
-            boolean inPlaceRollback) {
+            boolean inPlaceRollback, boolean skipNonNbtMca) {
         syncRecipeBook = recipeBook;
         syncChunksNearPlayer = chunksNearPlayer;
         setCooldownSeconds(cooldownSeconds);
         RollbackSettings.rollbackOnDeath = rollbackOnDeath;
         RollbackSettings.inPlaceRollback = inPlaceRollback;
+        RollbackSettings.skipNonNbtMca = skipNonNbtMca;
     }
 
     /** 改配方书开关（只改内存；落盘由平台配置层负责）。 */
@@ -128,6 +152,11 @@ public final class RollbackSettings {
     /** 改「原地回滚」开关（只改内存；落盘由平台配置层负责）。 */
     public static void setInPlaceRollback(boolean value) {
         inPlaceRollback = value;
+    }
+
+    /** 改「跳过非 NBT/MCA」开关（只改内存；落盘由平台配置层负责）。 */
+    public static void setSkipNonNbtMca(boolean value) {
+        skipNonNbtMca = value;
     }
 
     /**

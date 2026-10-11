@@ -12,6 +12,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.RegionFileStorage;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
+import net.minecraft.world.level.saveddata.SavedDataType;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.SavedDataStorage;
 import org.spongepowered.asm.mixin.Mixin;
@@ -24,21 +25,24 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /**
  * 回滚窗口内跳过「写了也会被覆盖」的世界落盘（NeoForge 26.1 版）。
  *
- * <p>F8 的流程是「关掉世界 → 用快照覆盖存档文件 → 重新开世界」。关世界那一步原版会把整个世界
- * 存一遍（区块 / 实体 / 玩家数据 / 维度数据），而这些数据马上就会被快照整体覆盖掉——大存档上是纯浪费，
- * 而且会在覆盖前又改一遍文件的 mtime，害得反向增量还原误判成「变了」。
+ * <p>F8 走的原地回滚不关世界：「强制卸载 → 内存直解灌装 → 重建重载 → 内存状态还原 → 标脏直写」。
+ * 卸载与重载这段窗口里，原版流水线仍会把「马上要被覆盖掉的未来脏状态」往盘上刷
+ * （卸载收尾的 {@code ChunkMap.save}、POI flush、实体/玩家收尾写入），所以窗口期内这些落盘
+ * 要整段跳过——不拦内存变更，只拦「写了也会被丢弃」的磁盘写入；被丢弃的写入也不进写账本。
+ * 「关世界 → 覆盖 → 重开」那条回退路径复用同一个窗口。
  *
- * <p>必须在回滚前把 {@link Rewind#beginDiscard()} 打开，覆盖完成（或任何失败路径）立刻
+ * <p>窗口由回滚编排显式开关：开始前 {@link Rewind#beginDiscard()} 打开，整段收尾（或任何失败路径）
  * {@link Rewind#endDiscard()} 关掉，否则后续正常游玩的世界保存会被一起跳过。
- * 这些注入只跳过写盘，不阻止关句柄：{@code IOWorker.close()} / {@code RegionFile.close()} 照常执行，
- * 所以覆盖 .mca 依然是安全的。
+ * 这些注入只跳过写盘，不阻止关句柄：{@code IOWorker.close()} / {@code RegionFile.close()} 照常执行
+ * （关世界那条路覆盖 .mca 依然安全）。
  *
  * <h2>26.1 的注入目标变化</h2>
  * <ul>
  *   <li><b>SavedData</b>：{@code SavedData.save(File, HolderLookup$Provider)} 已被删除——26.1 的
  *       {@code SavedData} 只剩内存里的脏标记，真正落盘的是 {@code SavedDataStorage}。所以那条挂点
- *       改挂在 {@code SavedDataStorage.scheduleSave()} 上：它是所有存档数据写盘（含
- *       {@code saveAndJoin()} / {@code close()}）的唯一汇点，取消掉就等于整段跳过。</li>
+ *       改成两层：高层 {@code scheduleSave()}（{@code saveAndJoin()} / {@code close()} 都走它）
+ *       与底层 {@code tryWrite(SavedDataType, CompoundTag)}（ioPool 线程上逐个落盘）——
+ *       两层都取消才算整段跳过，尤其要挡住标记打开之前就已经排进 ioPool 的那批写入。</li>
  *   <li><b>level.dat</b>：{@code LevelStorageAccess.saveDataTag(RegistryAccess, WorldData, CompoundTag)}
  *       变成了 {@code saveDataTag(WorldData, UUID)} → 私有 {@code saveLevelData(CompoundTag)}。
  *       这里挂在最底层的 {@code saveLevelData(CompoundTag)} 上：两条公开入口都汇到它，
@@ -149,9 +153,16 @@ public final class RollbackDiscardMixins {
     /**
      * 维度数据 / 服务器级数据（raids、random_sequences、scoreboard、weather 等）。
      *
-     * <p>26.1 没有 {@code DimensionDataStorage.save()}：{@code SavedDataStorage.scheduleSave()} 是唯一入口，
-     * {@code saveAndJoin()}（以及 {@code close()} 里的那一次）都走它。取消它 = 本次不写任何 .dat，
-     * 且不碰脏标记（脏数据留到下一轮正常保存，和 1.21.1 的语义一致）。
+     * <p>26.1 没有 {@code DimensionDataStorage.save()}：{@code SavedDataStorage.scheduleSave()} 征集脏条目，
+     * 真正落盘在 {@code tryWrite}（ioPool 线程）。两层都要挡：
+     *
+     * <ul>
+     *   <li>高层 {@code scheduleSave()}：{@code saveAndJoin()}（以及 {@code close()} 里的那一次）都走它。
+     *       取消它 = 本次不写任何 .dat，且不碰脏标记（脏数据留到下一轮正常保存，和 1.21.1 的语义一致）。</li>
+     *   <li>底层 {@code tryWrite(SavedDataType, CompoundTag)}：光挡高层不够——标记打开之前就已经
+     *       排进 ioPool 的写不经过 {@code scheduleSave()}，回滚期间照样落盘、改 mtime。
+     *       堵在写入汇点上，两类写入一起跳过（1.21.1 对应的是 {@code SavedData.save}）。</li>
+     * </ul>
      */
     @Mixin(SavedDataStorage.class)
     public abstract static class DataStorageDiscard {
@@ -162,6 +173,16 @@ public final class RollbackDiscardMixins {
         private void rewind$skipDataSaveDuringRollback(CallbackInfoReturnable<CompletableFuture<?>> cir) {
             if (Rewind.isDiscarding()) {
                 cir.setReturnValue(CompletableFuture.completedFuture(null));
+            }
+        }
+
+        @Inject(
+                method = "tryWrite(Lnet/minecraft/world/level/saveddata/SavedDataType;Lnet/minecraft/nbt/CompoundTag;)V",
+                at = @At("HEAD"),
+                cancellable = true)
+        private void rewind$skipDataTryWriteDuringRollback(SavedDataType<?> type, CompoundTag tag, CallbackInfo ci) {
+            if (Rewind.isDiscarding()) {
+                ci.cancel();
             }
         }
     }

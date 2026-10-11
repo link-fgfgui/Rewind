@@ -78,9 +78,10 @@ public final class RollbackAccessMixins {
         void rewind$processUnloads(BooleanSupplier supplier);
 
         /**
-         * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：强制标脏收尾时，
-         * 对“回滚影响过、但此时不在可见集合或已被卸载”的离线区块补齐落盘，
-         * 不依赖 {@code saveAllChunks} 的可见性/冷却过滤。
+         * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：第 13 步强制标脏收尾时，
+         * 在丢弃窗口之外显式落盘目标区块，不依赖 {@code saveAllChunks} 的可见性/冷却过滤，
+         * 让盘面立即收敛到快照内容（防丢保底）。只对内存里还在的区块调用——
+         * 目标区块在重载步骤已全部同步读回；仍缺席的（重载失败）交给退出世界落盘兜底。
          */
         @Invoker("save")
         boolean rewind$saveDirect(ChunkAccess chunk);

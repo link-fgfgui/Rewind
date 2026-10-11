@@ -3,6 +3,8 @@ package cc.sighs.rewind.common;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import cc.sighs.rewind.common.spi.DataCover;
 import cc.sighs.rewind.common.spi.StorageKind;
 import cc.sighs.rewind.common.spi.StorageOverlay;
@@ -27,7 +29,9 @@ import cc.sighs.rewind.common.spi.StorageOverlay;
  *       不再做 {@code .mca} 头部 8 KiB 比对。</li>
  *   <li>{@link #coldBaselines()} / {@link #frozenBases()}：首次写前捕获
  *       （Copy-on-First-Write）。冷区块被读入内存时登记基线，首次被改写时冻结为
- *       该存档点的回滚基底；从未被写过的冷区块不占快照资源，回滚时直接放行走盘。</li>
+ *       当前存档点状态的回滚基底；从不被写过的冷区块不占快照资源，回滚时直接放行走盘。
+ *       基底带「基线世代」标记（见 {@link #advanceBaseline} / {@link #selectBaseline}），
+ *       只服务同世代的回滚——跨存档点的旧基底一律忽略、回落快照解码，防止串数据。</li>
  *   <li>{@link #dataCover()}：非区块 NBT 覆盖（存档数据 / 玩家数据）。回滚灌装时
  *       从槽位目录读入快照 {@code .dat}，读拦截在武装窗口内短路喂出。</li>
  *   <li>{@link #isStorageCoverArmed()}：覆盖层武装状态。回滚重载那一小段里置位，
@@ -56,8 +60,39 @@ public final class RewindState {
      * 写前冻结基底（单例）：冷区块在当前存档点之后首次被改写时，把读时基线搬到这里，
      * 作为该存档点的回滚基底。回滚灌装（{@code populateCover}）优先用它，
      * 缺席才从快照块存储解码——二者都是快照数据，天然一致。
+     *
+     * <p>值里带「基线世代」：基底只对与它同世代的回滚有效（见 {@link #advanceBaseline} /
+     * {@link #selectBaseline}）。跨存档点时旧基底内容已经过时，必须忽略回落解码，
+     * 否则会把旧槽位的数据灌进新槽位。
      */
     private static final StorageOverlay frozenBases = new StorageOverlay();
+
+    /**
+     * 基线世代计数器：每次建点或回滚切槽位都换一个新值。
+     *
+     * <p>世代即「这份状态等于哪个存档点」——冻结基底按世代隔离，跨世代的基底不会被采纳。
+     */
+    private static final AtomicLong baselineGeneration = new AtomicLong();
+
+    /** 当前世界状态对应的基线世代：冻结时打在基底上，灌装取用时比对。 */
+    private static volatile long activeBaselineGeneration;
+
+    /**
+     * 本会话里各槽位建点时的基线世代：回滚时把世代切回目标槽位，让该槽位时代的基底重新可用。
+     * 只活在内存里——重启后基底本来就没了，全部失配（回落快照解码）正好。
+     */
+    private static final Map<String, Long> slotBaselineGenerations = new ConcurrentHashMap<>();
+
+    /** 冻结基底值：{@code tag} 是写前 NBT 拷贝，{@code generation} 是它所属的基线世代。 */
+    private static final class FrozenBase {
+        private final long generation;
+        private final Object tag;
+
+        private FrozenBase(long generation, Object tag) {
+            this.generation = generation;
+            this.tag = tag;
+        }
+    }
 
     /** 非区块 NBT 覆盖（存档数据 / 玩家数据，键见 {@link DataCover}）。 */
     private static final DataCover dataCover = new DataCover();
@@ -106,14 +141,55 @@ public final class RewindState {
     /**
      * 清掉写拦截的账本：建点成功后以新存档点为基线重记。
      *
-     * <p>连带清掉读时基线（上一基线的“未改动”假设已随新存档点失效）；
-     * 写前冻结基底按槽位归属保留在内存（它是旧槽位的回滚基底，持久化回填见建点流程），
-     * 不随建点清空——内存开销与“自上次全量基线后改过的冷区块数”成正比。
-     * 回滚完成后的清理由回滚收尾负责（撤装时清账本，见 {@link #disarmStorageCover}）。
+     * <p>连带清掉读时基线（上一基线的“未改动”假设已随新存档点失效）；冻结基底不清，
+     * 由 {@link #advanceBaseline} 连基线世代一起前移。回滚完成后的清理由回滚收尾负责
+     * （撤装时清账本，见 {@link #disarmStorageCover}）。
      */
     public static void clearStorageJournal() {
         storageJournal.clear();
         coldBaselines.clear();
+    }
+
+    /**
+     * 建点后的基线前移：清账本 + 给新存档点发一个新基线世代，当前世界状态就站在这个世代上。
+     *
+     * <p>节点由「时间线的头」（正在覆盖的那个槽位）或任意新槽位承担，建完点世界就站在它上面。
+     * 世代前移后，之前世代的冻结基底不会再被采纳（它们对应的是建点前那个存档点的状态），
+     * 但仍留在内存里：回滚到那个旧槽位时 {@link #selectBaseline} 会把世代切回去、重新可用。
+     * 内存开销与「各世代里被首次改写的冷区块数」成正比，停服由 {@link #onWorldUnloaded} 清空。
+     */
+    public static void advanceBaseline(String slot) {
+        long generation = baselineGeneration.incrementAndGet();
+        if (slot != null && !slot.isEmpty()) {
+            slotBaselineGenerations.put(slot, generation);
+        }
+        activeBaselineGeneration = generation;
+        clearStorageJournal();
+    }
+
+    /**
+     * 回滚开始前把基线世代切到目标槽位：只有该槽位时代的冻结基底才允许被灌装采纳。
+     *
+     * <p>本会话里没有该槽位的建点记录（重启过，或槽位来自旧会话）时发一个全新世代——
+     * 现有基底全部失配，回滚一律走快照块存储解码，宁慢勿串。
+     */
+    public static void selectBaseline(String slot) {
+        Long generation = slot == null ? null : slotBaselineGenerations.get(slot);
+        if (generation != null) {
+            activeBaselineGeneration = generation;
+        } else {
+            invalidateBaseline();
+        }
+    }
+
+    /**
+     * 基线失配：当前世界状态不再等于任何已记录的存档点（典型：回滚半途失败）。
+     *
+     * <p>发一个全新世代让现有冻结基底全部作废——它们对应的旧状态已经对不上现实，
+     * 之后回滚一律走快照解码，宁慢勿串。
+     */
+    public static void invalidateBaseline() {
+        activeBaselineGeneration = baselineGeneration.incrementAndGet();
     }
 
     /**
@@ -164,26 +240,40 @@ public final class RewindState {
             Object base = coldBaselines.serve(kind, dimensionId, chunkPos);
             // serve 对删除标记返回 null；基线是读到的数据，一定非空，这里只防一手
             if (base != null) {
-                frozenBases.putIfAbsent(kind, dimensionId, chunkPos, base);
+                Object existing = frozenBases.serve(kind, dimensionId, chunkPos);
+                if (!(existing instanceof FrozenBase)
+                        || ((FrozenBase) existing).generation != activeBaselineGeneration) {
+                    // 每个坐标只留「当前世代」的那一份基底；旧世代的那份只在回滚到它的
+                    // 存档点时才有意义，这里换掉不影响——那边本来就是同一份快照数据。
+                    frozenBases.onWritten(kind, dimensionId, chunkPos,
+                            new FrozenBase(activeBaselineGeneration, base));
+                }
             }
             coldBaselines.discard(kind, dimensionId, chunkPos);
         }
         storageJournal.onWritten(kind, dimensionId, chunkPos, journalCopy);
     }
 
-    /** 写前冻结基底（回滚灌装优先用它；返回引用，调用方要 {@code copy()} 后再交出去）。 */
+    /**
+     * 写前冻结基底（回滚灌装优先用它；返回引用，调用方要 {@code copy()} 后再交出去）。
+     *
+     * <p>只有基底所属世代与当前基线世代一致时才返回：跨存档点的基底内容已经过时，
+     * 返回 {@code null} 让调用方回落快照块存储解码。
+     */
     public static Object frozenBase(StorageKind kind, String dimensionId, long chunkPos) {
         if (kind == null || dimensionId == null) {
             return null;
         }
-        return frozenBases.serve(kind, dimensionId, chunkPos);
+        Object value = frozenBases.serve(kind, dimensionId, chunkPos);
+        if (value instanceof FrozenBase && ((FrozenBase) value).generation == activeBaselineGeneration) {
+            return ((FrozenBase) value).tag;
+        }
+        return null;
     }
 
+    /** 当前世代有没有可用的冻结基底（见 {@link #frozenBase}）。 */
     public static boolean coversFrozenBase(StorageKind kind, String dimensionId, long chunkPos) {
-        if (kind == null || dimensionId == null) {
-            return false;
-        }
-        return frozenBases.covers(kind, dimensionId, chunkPos);
+        return frozenBase(kind, dimensionId, chunkPos) != null;
     }
 
     /** 读时基线账本（测试与回滚对账用；线上只经上述静态方法访问）。 */
@@ -242,6 +332,7 @@ public final class RewindState {
     public static void onWorldUnloaded() {
         disarmStorageCover();
         frozenBases.clear();
+        slotBaselineGenerations.clear();
         clearUnloadGuards();
     }
 

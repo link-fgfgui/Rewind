@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.regex.Pattern;
+import cc.sighs.rewind.common.config.RollbackSettings;
 import cc.sighs.rewind.common.config.SlotSettings;
 
 /**
@@ -58,6 +59,12 @@ public final class SnapshotLayout {
     public static final String STATUS_COMPLETE = "complete";
 
     private static final String LOCK_FILE_NAME = "session.lock";
+    /** 进度目录：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String ADVANCEMENTS_DIR = "advancements";
+    /** 统计目录：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String STATS_DIR = "stats";
+    /** 世界图标：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String ICON_FILE_NAME = "icon.png";
     /** 玩家数据目录（≤ 1.21.1）。 */
     private static final String PLAYER_DATA_DIR = "playerdata";
     /** 玩家数据目录（26.1 起搬到这里，见 {@code LevelResource.PLAYER_DATA_DIR}）。 */
@@ -201,7 +208,8 @@ public final class SnapshotLayout {
      * 判断一个相对路径是否应该被排除。
      *
      * <p>排除 {@code session.lock}、存档点目录自身，以及原版与 Rewind 自己写盘留下的临时文件；
-     * 其余（含 .mcc 超大区块文件、datapacks/、advancements/、stats/ 等）都算存档状态。
+     * 其余（含 .mcc 超大区块文件、datapacks/、`serverconfig/` 等）都算存档状态。`advancements/`、
+     * `stats/` 与 `icon.png` 只有 `rollback.skipNonNbtMca` 开着才排除（见 {@link RollbackSettings}）。
      */
     public static boolean isExcluded(String relativePath) {
         String path = normalize(relativePath);
@@ -232,6 +240,11 @@ public final class SnapshotLayout {
         }
         if ((first.equals(PLAYER_DATA_DIR) || path.startsWith(PLAYERS_DATA_DIR + "/"))
                 && PLAYER_DATA_TEMP.matcher(last).matches()) {
+            return true;
+        }
+        if (RollbackSettings.skipNonNbtMca()
+                && (first.equals(ADVANCEMENTS_DIR) || first.equals(STATS_DIR)
+                        || path.equals(ICON_FILE_NAME))) {
             return true;
         }
         return false;

@@ -70,13 +70,37 @@ class CowBaselineTest {
     }
 
     @Test
-    void checkpointClearKeepsFrozenForOldSlots() {
+    void checkpointClearKeepsTheBaseForTheSameBaseline() {
         Object baseline = new Object();
         RewindState.noteColdBaseline(StorageKind.CHUNK, DIM, POS, baseline);
         RewindState.recordChunkWrite(StorageKind.CHUNK, DIM, POS, new Object());
         RewindState.clearStorageJournal();
         assertEquals(0, RewindState.storageJournal().size());
         assertSame(baseline, RewindState.frozenBase(StorageKind.CHUNK, DIM, POS),
-                "建点清账本不得丢掉旧槽位的冻结基底");
+                "清账本本身不换世代：同一存档点内的基底继续可用");
+    }
+
+    @Test
+    void frozenBaseIsScopedToTheBaselineItBelongsTo() {
+        Object baseline = new Object();
+        RewindState.advanceBaseline("s1");
+        RewindState.noteColdBaseline(StorageKind.CHUNK, DIM, POS, baseline);
+        RewindState.recordChunkWrite(StorageKind.CHUNK, DIM, POS, new Object());
+        assertSame(baseline, RewindState.frozenBase(StorageKind.CHUNK, DIM, POS),
+                "与当前基线同世代：冻结基底可用");
+
+        // 又建了点（世界站到 s2 上）：s1 世代的基底内容对应的是建点前的状态，不得再被采纳
+        RewindState.advanceBaseline("s2");
+        assertNull(RewindState.frozenBase(StorageKind.CHUNK, DIM, POS),
+                "跨存档点不得采纳旧世代基底（防多槽位串数据）");
+
+        // 回滚到 s1：世代切回，s1 世代的基底重新可用
+        RewindState.selectBaseline("s1");
+        assertSame(baseline, RewindState.frozenBase(StorageKind.CHUNK, DIM, POS),
+                "切回目标槽位的世代后基底重新可用");
+
+        // 本会话没建过点的槽位：全部失配，回落快照解码
+        RewindState.selectBaseline("unknown");
+        assertNull(RewindState.frozenBase(StorageKind.CHUNK, DIM, POS));
     }
 }

@@ -165,6 +165,11 @@ public final class ForgeRewindPlatform implements RewindPlatform {
         if ("minecraft:the_end".equals(dimensionId)) {
             return "DIM1/" + leaf;
         }
-        return null;
+        // 自定义维度（数据包 / 模组）：原版目录规范 dimensions/<ns>/<path>/，path 段可带 `/`
+        int colon = dimensionId.indexOf(':');
+        if (colon <= 0 || colon == dimensionId.length() - 1) {
+            return null;
+        }
+        return "dimensions/" + dimensionId.substring(0, colon) + "/" + dimensionId.substring(colon + 1) + "/" + leaf;
     }
 }

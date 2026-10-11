@@ -230,12 +230,12 @@ F7 / F8 与时间树都是**世界里**的动作；世界一旦坏到打不开�
 
 ### 回滚窗口与快速重启（neoforge-1.21.1）
 
-F8 回溯分三步：关世界 → 用快照覆盖存档文件 → 重新开世界。前两步之间那段「世界马上要被整体覆盖」的时间叫**回滚窗口**，由 `RewindState.beginDiscard()` / `endDiscard()`（common 的 `cc.sighs.rewind.Rewind` 门面）标记（`CheckpointController` 在按下 F8 时打开、快照写完后关闭，失败路径也会关）：
+F8 默认走**原地回滚**（见下一节）；关掉 `rollback.inPlaceRollback` 时才走三步：关世界 → 用快照覆盖存档文件 → 重新开世界。两条路都用同一个**回滚窗口**：窗口期内世界马上要被整体倒回，任何落盘都是要被丢弃的，由 `RewindState.beginDiscard()` / `endDiscard()`（common 的 `cc.sighs.rewind.Rewind` 门面）标记（回滚开始时打开、整段结束或失败路径关闭）：
 
 - 窗口内所有世界落盘由 `cc.sighs.mixin.RollbackDiscardMixins` 跳过：区块 / 实体 / 玩家数据 / 维度数据 / region 写入 / level.dat，同时跳过 `stopServer` 那个「排空 chunkMap」的循环；关句柄与释放 `session.lock` 不受影响。**改动任何保存路径时要回来对照这些注入点**——漏掉的写入虽然随后会被快照覆盖，但会把文件 mtime 改脏，让反向增量还原误判成「变了」而白拷一遍。
-  > 26.1 上的对应物：`SavedData.save(File, HolderLookup$Provider)` 已删除，存档数据的写盘汇点变成 `SavedDataStorage.scheduleSave()`；level.dat 那条从 `saveDataTag(RegistryAccess, WorldData, CompoundTag)` 变成了私有的 `saveLevelData(CompoundTag)`（两条公开入口都汇到它）。其余目标签名不变。
+  > 26.1 上的对应物：`SavedData.save(File, HolderLookup$Provider)` 已删除，存档数据的写盘汇点变成 `SavedDataStorage` 两层——高层 `scheduleSave()`（征集脏条目）与底层 `tryWrite(SavedDataType, CompoundTag)`（ioPool 上真正落盘，**这层也要挡**，否则标记打开前已排队的写入照样落盘改 mtime）；level.dat 那条从 `saveDataTag(RegistryAccess, WorldData, CompoundTag)` 变成了私有的 `saveLevelData(CompoundTag)`（两条公开入口都汇到它）。其余目标签名不变。
 - 重新开世界走**快速重启**：复用上一轮的 `LayeredRegistryAccess` 与 `ReloadableServerResources`（重建世界时它们不会被关闭），只重读 level.dat（`LevelStorageSource.getLevelDataAndDimensions` + 重新 bake DIMENSIONS 层），再自己驱动 `Minecraft.doWorldLoad`，从而跳过 `WorldLoader.load` 的数据包 / 注册表 / 配方 / 战利品 / 标签 / 函数重载。26.1 起游戏规则也搬进了 SavedData，`doWorldLoad` 的 `Optional<GameRules>` 必须传**空**（与原版 `openWorld` 一致），规则才会从快照覆盖过的磁盘读回来；传回溯前捕获的那份会把旧规则灌回去、还会在下一次自动保存写回磁盘。任何一步失败都会自动退回 `WorldOpenFlows.openWorld`（见 `CheckpointController.tryFastRestart`）。
-- 回溯时的文件回拷是**反向增量**：用建点时记录的清单判断活动存档里哪些文件还是原样，只回拷真正被改写过的，并把回拷文件的 mtime 拨回建点时的值（`SnapshotMirror.Direction.TO_WORLD`）。
+- 关世界那条路的文件回拷是**反向增量**：用建点时记录的清单判断活动存档里哪些文件还是原样，只回拷真正被改写过的，并把回拷文件的 mtime 拨回建点时的值（`SnapshotMirror.Direction.TO_WORLD`）。原地回滚不再回拷任何文件——改为覆盖层内存直解，见下一节。
 
 ### 原地回滚
 
@@ -243,26 +243,29 @@ F8 默认走**原地回滚**（`cc.sighs.rewind.server.InPlaceRollback`）：世
 
 `neoforge-26.1` 也接了同一份引擎：`NeoForge261RewindPlatform.supportsInPlaceRollback()` 返回 true，`rollbackInPlace` 走 26.1 版的 `InPlaceRollback`。步骤顺序、保护条件、`Result` 口径与 1.21.1 完全一致，换掉的只是原版内部入口——`DimensionDataStorage` → `SavedDataStorage`（缓存键变成 `SavedDataType<?>`）、`Raids.getFileId()/factory()` → `Raids.TYPE`、记分板改走 `ServerScoreboard.load(Packed)`、`player.load(CompoundTag)` → `player.load(ValueInput)`（维度读 `ServerPlayer.SavedPosition`）、天气从 level.dat 挪进服务器级 `WeatherData` SavedData、时间字段 `GameTime/DayTime` 变成单个 `Time`、出生点变成 `LevelData.RespawnData`。存档数据一律「作废缓存 → 从已被快照覆盖的磁盘重新读」，所以不硬编码 `data/*.dat` 的路径（26.1 的 SavedData 落盘是 `<dataFolder>/<namespace>/<path>.dat`）。逐条对照写在 `versions/26.1-neoforge/src/main/java/cc/sighs/rewind/server/InPlaceRollback.java` 与 `RollbackAccessMixins.java` 的类注释里。
 
-顺序（每一步都有非它不可的理由，改之前先读 `InPlaceRollback` 的类注释）：
+顺序（每一步都有非它不可的理由，改之前先读 `InPlaceRollback` 的类注释）——与 TODO1 的 13 步流水线一一对应：
 
-0. **先排空排队中的写入**：`Rewind.endDiscard()` → 三条存储链 `synchronize(false)` → `beginDiscard()`。已经排队但还没落盘的写入如果被跳过，这些区块在内存里已经不是 `isUnsaved()`、磁盘上又还没变，下面的文件判据都会漏掉它。这段时间世界不会 tick（我们就在服务端线程上），所以不会有新的写入插进来。
-1. **找受影响区块**：遍历已加载的 `ChunkHolder`，四条判据任一成立就算受影响——`isUnsaved()`；**区块 / 实体 / POI** 三个 region 文件的 per-chunk 偏移/时间戳与快照不一致（读 .mca 头部那 8 KiB）；内存里还有会被保存的实体；快照里这个区块本来有实体。所以代价与「真正改了多少区块」成正比，与视距无关；已在下沉路上的区块（ticket level > `ChunkLevel.MAX_LEVEL`）直接跳过。
+1. **先排空排队中的写入**：`Rewind.endDiscard()` → 三条存储链 `synchronize(false)`（`flushWorkers`）→ `beginDiscard()`。已经排队但还没落盘的写入如果被跳过，这些区块在内存里已经不是 `isUnsaved()`、磁盘上又还没变，后面的判据都会漏掉它。这段时间世界不会 tick（我们就在服务端线程上），所以不会有新的写入插进来。
+2. **找受影响区块**：直接用写盘监听账本的精确变更集（建点之后写过的坐标，含已卸载的），加上内存判据（`isUnsaved()`、内存里有会被保存的实体）与快照实体判据。**对 `/saves` 活文件 0 读取**——老的 `.mca` 头部 8 KiB 比对已删（唯一例外：1.20.1 上布局反推不出维度的模组自定义维度，退回头部比对兜底）。代价与「真正改了多少区块」成正比，与视距无关；已在下沉路上的区块（ticket level > `ChunkLevel.MAX_LEVEL`）直接跳过。
    > 实体那两条判据是必须的：`EntityStorage` 是**另一套**文件（`<维度>/entities/r.x.z.mca`），而且实体存储**没有 per-chunk 脏标记**、只在自动保存时才整体重写，所以「建点之后新放的实体」在落盘之前磁盘上完全看不出来，`isUnsaved()` 也不会被置位（`setUnsaved(true)` 的来源只有方块 / 方块实体 / 光照 / 计划刻 / 结构）。
-2. **强制卸载**：把 ticket level 顶到 `ChunkLevel.MAX_LEVEL + 1`，挂进 `DistanceManager.chunksToUpdateFutures`，再反复推进 `ChunkMap.processUnloads` / `ServerChunkCache.runDistanceManagerUpdates`。回滚窗口开着，卸载触发的落盘被跳过。
+3. **强制卸载**：把 ticket level 顶到 `ChunkLevel.MAX_LEVEL + 1`，挂进 `DistanceManager.chunksToUpdateFutures`，再反复推进 `ChunkMap.processUnloads` / `ServerChunkCache.runDistanceManagerUpdates`。回滚窗口开着，卸载触发的落盘被跳过。
    > 必须同时挡掉**重建**：玩家 ticket 一直认为这些区块该加载，ticket 图的邻居传播会把 `ChunkMap.updateChunkScheduling` 又叫回来把 holder 重建出来，重建的 holder 会走一遍晋升流水线、拉起 worldgen 任务，把 `generationRefCount` 钉在正被卸载的区块上——`processUnloads` 遇到 refCount 非 0 的 holder 直接跳过，卸载就永远跑不完（现象是 `stuck=` 一大堆、`unloadMs` 上千毫秒）。`InPlaceGuardMixins` 只在 `Rewind.beginUnloadGuard` 登记过的位置、且是「重建」这一种情形下拦掉，降级 / 卸载不受影响；名单在重建 holder 之前 `Rewind.clearUnloadGuards()` 清掉。卸载流水线连续 `STALL_ROUNDS` 轮没进展就放弃并记日志，不再空转。
-3. **实体卸载排空**：由区块状态驱动、靠 `PersistentEntitySectionManager.tick()` 推进，而且实体还没读回来（status 不是 LOADED）时 `storeChunkSections` 会直接放弃、留到下一 tick。所以必须在这一段里泵到 `chunksToUnload` 空——否则那些被推迟的卸载会落到回滚窗口之外，把「改世界之后」的实体列表写回刚还原的文件。
-4. **作废按区块缓存**：`EntityStorage.emptyChunks`（否则快照里本来有实体的区块会被当成空区块）与 POI 的分段缓存（否则留下幻影兴趣点）。POI 的 `storage` 与 `dirty` 两个键**都要删**——只删 `storage` 的话键还留在 `dirty` 里，下一 tick `tick()` 会把空 section 写回去，盖掉刚还原的 poi 文件。必须在第 3 步之后做。
-5. **释放 region 句柄**：Windows 上打开着的 .mca 会锁住文件。关之前先 `IOWorker.synchronize(false)` 排空排队中的写入，然后关掉 `RegionFile` 并**清空 `RegionFileStorage.regionCache`**——原版 `close()` 只关不清，不清的话下一次访问会拿到已关闭的句柄。
-6. **回拷文件**：`SnapshotMirror` 反向增量，逻辑与老路共用。
-7. **玩家 / 时间天气**：`playerdata` NBT → `player.load` + 手动补齐客户端同步；level.dat 的值写进活着的 `WorldData`（不动磁盘文件）。位置很讲究——**必须排在 holder 重建之后、区块成批重发之前**：
+4. **区块卸载排空**：反复推进 `processUnloads` / `runDistanceManagerUpdates`，直到 `toDrop` / `pendingUnloads` / `unloadQueue` 三个队列都空；连续多轮没进展就放弃并记日志（剩下的交给重建那一步兜住）。
+5. **实体卸载排空**：由区块状态驱动、靠 `PersistentEntitySectionManager.tick()` 推进，而且实体还没读回来（status 不是 LOADED）时 `storeChunkSections` 会直接放弃、留到下一 tick。所以必须在这一段里泵到 `chunksToUnload` 空——否则那些被推迟的卸载会落到回滚窗口之外，把「改世界之后」的实体列表写回刚还原的文件。
+6. **作废按区块缓存**：`EntityStorage.emptyChunks`（否则快照里本来有实体的区块会被当成空区块）与 POI 的分段缓存（否则留下幻影兴趣点）。POI 的 `storage` 与 `dirty` 两个键**都要删**——只删 `storage` 的话键还留在 `dirty` 里，下一 tick `tick()` 会把空 section 写回去，盖掉刚还原的 poi 文件。必须在第 5 步之后做。
+7. **`closeStorageHandles`（释放 region 句柄）已彻底删除**：回滚不写 `/saves`、不关存储句柄，原版句柄继续用，Windows 文件锁占用问题自然消失。
+8. **`restoreInto`（回拷物理文件）已彻底删除**：不再对活动存档做物理文件覆写——这就是核心路线的「0 读 0 写」中「0 写」的部分；收尾的直写保底走原版标准管道，见第 13 步。
+9. **灌装覆盖层（内存直解）**：把基线世代切到目标槽位（`selectBaseline`——冻结基底只服务同世代的回滚，跨存档点的旧基底一律忽略、回落块存储解码，防多槽位串数据）；受影响区块从目标槽位的 `SnapshotBlockStore` 按 5 字节 Anvil 头截断 + 版本分派直接解出 NBT（含 `.mcc` 外溢），写前冻结基底优先；存档数据 / 玩家数据从槽位目录读入 `DataCover`，快照里没有的记删除标记（读拦截短路喂空，防「删后复活」）。**对 `/saves` 活文件 0 读取**；灌完 `armStorageCover()` 武装读拦截。
+10. **重建 holder**：给卸载掉的区块重建 holder（`updateChunkScheduling`，还原卸载前的 ticket level），推进 `runDistanceManagerUpdates` 让区块重新排队。
+11. **玩家 / 时间天气**：`playerdata` NBT → `player.load` + 手动补齐客户端同步；level.dat 的值写进活着的 `WorldData`（不动磁盘文件）。位置很讲究——**必须排在 holder 重建之后、区块成批重发之前**：
    - 不能更晚：恢复位置会走 `ServerGamePacketListenerImpl.teleport`，它设的 `awaitingPositionFromClient` 会让服务端**整段跳过右键方块交互**（`handleUseItemOn` 里那道 `awaitingPositionFromClient == null` 的门），而清掉它的客户端 ack 要排在几百个区块包后面；先发位置包，ack 就只要一个客户端 tick。
    - 不能更早：`player.load` 会走 `Entity.setPosRaw`，NeoForge 在那里加了 `level.getChunk(...)`（"ensure target chunk is loaded"），holder 不在就会在 `ChunkMap.acquireGeneration` 上 NPE，或者抛 `Chunk not there when requested`。
-8. **重载**：给卸载掉的区块重建 holder，`ServerChunkCache.getChunk(..., FULL, true)` 同步等它读回来；原版的发送流水线会把新数据推给客户端（客户端 `replaceWithPacketData` 对已存在的区块是原地替换，不需要重连）。
-9. **内存里的存档数据**：先作废每个维度（26.1 还有服务器级那份）存档数据缓存里「没被强引用」的条目，让它们下次访问时从（已被快照覆盖的）磁盘重读——**模组写在 `<维度>/data/*.dat` 里的数据就是靠这一条跟着回滚的**；再显式重建被长生命周期对象强引用、而且能从磁盘重读内容的那几个（袭击、记分板、等级附件 / 等级能力）；最后通知模组侧丢掉自己的解码缓存（`SophisticatedCoreCompat`）。
+12. **同步重载 + 存档数据重读**：`ServerChunkCache.getChunk(..., FULL, true)` 把目标区块**全部同步读回**（不设视野外延迟——覆盖层撤装即清，延迟加载会错过覆盖、穿透读到盘上的未来数据），读拦截稀疏短路喂出快照（未覆盖区域穿透走盘）；原版发送流水线把新数据推给客户端（`replaceWithPacketData` 对已存在的区块原地替换，不需要重连）。随后先作废每个维度（26.1 还有服务器级那份）存档数据缓存里「没被强引用」的条目，让它们下次访问时**经读拦截从覆盖层重读**——**模组写在 `<维度>/data/*.dat` 里的数据就是靠这一条跟着回滚的**；再显式重建被长生命周期对象强引用、而且能从覆盖层重读内容的那几个（袭击、记分板、等级附件 / 等级能力）；最后通知模组侧丢掉自己的解码缓存（`SophisticatedCoreCompat`）。
+13. **强制标脏与直写保障（收尾）**：先在撤装**前**取覆盖命中数（`serveHits`，撤装会连账本一起清，取晚了恒为 0——它是稀疏拦截的验收口），`disarmStorageCover()` 撤装（先撤装再开写：直写经原版管道被写监听记成新基线）；然后遍历目标 `setUnsaved(true)` + `refreshAccessibility()`、存档数据 `setDirty(true)`，并在丢弃窗口之外显式 `ChunkMap.save(chunk)` 直写一遍——不经 `saveAllChunks` 的可见性 / 冷却过滤，进程崩溃也不丢回滚；写完 `flushWorkers` 排空。目标区块在第 12 步已全部同步读回，这里仍拿不到内存区块的坐标（重载失败）由退出世界的生命周期落盘兜底。
 
-回滚窗口**一直开到整段结束**（`run` 的 `finally` 才 `endDiscard()`）：这期间任何落盘都是要被丢弃的，第 3 步那些卸载收尾写入尤其危险。
+回滚窗口**一直开到整段结束**（`run` 的 `finally` 才 `endDiscard()`；第 13 步的直写在撤装后、关窗前进行）：这期间任何落盘都是要被丢弃的，卸载收尾写入尤其危险。
 
-需要的原版内部入口全部集中在 `cc.sighs.mixin.RollbackAccessMixins`（`@Accessor` / `@Invoker`），业务代码不直接碰反射。`RollbackDiscardMixins` 另外挡掉了 `ChunkMap.save(ChunkAccess)`——卸载路径本身会调它，回滚窗口内整段跳过（省掉 `ChunkSerializer.write`）。
+需要的原版内部入口全部集中在 `cc.sighs.mixin.RollbackAccessMixins`（`@Accessor` / `@Invoker`），业务代码不直接碰反射。`RollbackDiscardMixins` 挡掉窗口内所有「写了也会被丢弃」的落盘汇点（区块 / POI / 实体 / 玩家 / 维度数据 / level.dat / `RegionFileStorage.write`），并顺手清 POI 脏标记；卸载路径调的 `ChunkMap.save(ChunkAccess)` 整段跳过（省掉 `ChunkSerializer.write`）。
 
 **已知边界**：回滚只保证**磁盘**，加上「能被重新读回来的那部分内存状态」。收尾时先把每个维度（以及 26.1 的服务器级）存档数据缓存里**没被强引用**的条目全摘掉，让它们下次访问时从快照重读；被长生命周期对象用字段（或脏标记回调）钉住的那些必须显式重建，其中**能从磁盘重读内容的**才真回滚（袭击、记分板、等级附件 / 等级能力），**没有重建入口的**只保证「继续落盘」、内存内容留在原处、下次自动保存写回磁盘——各版本的清单不同（见「已知的跨 target 差异」）。⚠️ **摘一个条目之前先确认它还有没有别的登记点**：`DimensionDataStorage.save()` 只遍历缓存，摘掉又没人重新登记，那个 `.dat` 就再也不会被写（静默丢数据）。记分板另外有两个坑：它的缓存条目**不能摘**（`ServerScoreboard.dirtyListeners` 里存着它的脏标记回调），而且要先清空活着的记分板再灌内容（`Scoreboard.addObjective` 对重名会抛异常，原版日志里那句 `Error loading saved data: scoreboard`）——所以走的是「清 objective / team → `new ScoreboardSaveData(scoreboard).load(...)`」，不是 `computeIfAbsent`（后者每回滚一次就多加一条脏标记回调）。此外：卸载时还有生成任务在飞的少数区块会被跳过（日志里以 `stuck=` 计数出现）；只要区块内存里还有会被保存的实体，它就会被判成受影响并重载——实体回滚的代价与「视野内有多少带实体的区块」相关，这是实体存储没有脏标记的直接后果；**模组自己缓存的解码结果**（典型：精妙核心的 `StorageWrapperRepository`）不归世界生命周期管，只能靠针对性适配去清，没适配的模组就只能关掉 `rollback.inPlaceRollback` 走完整重开（精妙核心这层适配的**逐版本情形**写在 `SophisticatedCoreCompat` 的类注释里：1.21.1 / 26.1 的 Core 有那个缓存类、可清；1.20.1 的 Core **没有**这个类——那一版根本没有静态 wrapper 缓存，所以是「正确的空操作」；精妙也没有 1.20.1 的 Fabric 构建，Fabric 上永远不会命中）。
 
