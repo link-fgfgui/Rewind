@@ -182,6 +182,79 @@ public final class SnapshotBlockStore implements Closeable {
         return new Stored(hashes, newBytes);
     }
 
+    /**
+     * 把内存里的字节按 4 KiB 切块收进这次会话（语义与 {@link #encode(Path)} 一致，只是源是内存）。
+     *
+     * <p>增量建点用它：版本节点把监听到的 NBT 在内存里按 Anvil 扇区组装好，common 只管切块入库，
+     * 全程不读 {@code /saves}。空数组返回空哈希序列（对应 0 字节文件）。
+     */
+    public Stored encodeBytes(byte[] data) throws IOException {
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        List<String> hashes = new ArrayList<>();
+        long newBytes = 0L;
+        MessageDigest digest = sha256();
+        int offset = 0;
+        // 空文件：不收任何块，调用方按 size=0 重建出空文件
+        while (offset < data.length) {
+            int length = Math.min(BLOCK_SIZE, data.length - offset);
+            byte[] block = Arrays.copyOfRange(data, offset, offset + length);
+            String hash = hex(digest.digest(block));
+            hashes.add(hash);
+            if (!contains(hash)) {
+                pending.computeIfAbsent(shardOf(hash), key -> new LinkedHashMap<>()).put(hash, block);
+                newBytes += length;
+            }
+            offset += length;
+        }
+        return new Stored(hashes, newBytes);
+    }
+
+    /**
+     * 按块哈希序列把文件完整重建成内存字节（大小必须与 {@code size} 一致）。
+     *
+     * <p>单区块解码与增量组装用它：读的是快照块存储（允许），不碰 {@code /saves} 活文件。
+     * 文件越大越占内存——调用方一次只重建一个 region 文件（通常几 MB），用完即弃。
+     */
+    public byte[] readAll(List<String> hashes, long size) throws IOException {
+        if (size < 0) {
+            throw new IOException("negative file size: " + size);
+        }
+        if (size > Integer.MAX_VALUE) {
+            throw new IOException("file too large to materialize: " + size);
+        }
+        if (size == 0) {
+            return new byte[0];
+        }
+        if (hashes == null || hashes.isEmpty()) {
+            throw new IOException("block list is empty but size is " + size);
+        }
+        byte[] out = new byte[(int) size];
+        readRangeInto(hashes, size, 0, out, 0, (int) size);
+        return out;
+    }
+
+    /**
+     * 读文件区间 {@code [offset, offset + length)}（按块哈希序列寻址）。
+     *
+     * <p>解码器用它只拿头部 8 KiB 与目标扇区，避免为读一个区块重建整个文件。
+     */
+    public byte[] readRange(List<String> hashes, long fileSize, long offset, int length) throws IOException {
+        if (length < 0 || offset < 0) {
+            throw new IOException("negative range: offset=" + offset + " length=" + length);
+        }
+        if (length == 0) {
+            return new byte[0];
+        }
+        if (offset + length > fileSize) {
+            throw new EOFException("range [" + offset + ", " + (offset + length) + ") exceeds file size " + fileSize);
+        }
+        byte[] out = new byte[length];
+        readRangeInto(hashes, fileSize, offset, out, 0, length);
+        return out;
+    }
+
     /** 这个块已经有了吗（已经在存储里，或者这次会话已经收进去了）。 */
     private boolean contains(String hash) {
         Map<String, byte[]> buffered = pending.get(shardOf(hash));
@@ -328,6 +401,46 @@ public final class SnapshotBlockStore implements Closeable {
             written += count;
         }
         return out;
+    }
+
+    /**
+     * 把 {@code [fileOffset, fileOffset + length)} 区间读进 {@code out[destOffset, ...)}。
+     *
+     * <p>块按 {@link #BLOCK_SIZE} 顺序拼接（最后一块可能不足一块），按文件偏移换算到块号，
+     * 只读区间覆盖到的块。调用方保证区间不越界（越界抛 {@link EOFException} 由上层按损坏处理）。
+     */
+    private void readRangeInto(List<String> hashes, long fileSize, long fileOffset,
+            byte[] out, int destOffset, int length) throws IOException {
+        if (length == 0) {
+            return;
+        }
+        // 逐块拷贝：块 i 覆盖文件字节 [i*BLOCK_SIZE, min((i+1)*BLOCK_SIZE, fileSize))
+        byte[] block = new byte[BLOCK_SIZE];
+        long pos = fileOffset;
+        int dest = destOffset;
+        int remain = length;
+        while (remain > 0) {
+            long blockIndex = pos / BLOCK_SIZE;
+            if (blockIndex >= hashes.size()) {
+                throw new EOFException("block index " + blockIndex + " out of range for " + hashes.size() + " blocks");
+            }
+            String hash = hashes.get((int) blockIndex);
+            long[] location = require(hash, null);
+            int storedLen = (int) location[1];
+            long blockStart = blockIndex * BLOCK_SIZE;
+            // 块内起点与可读长度（最后一块可能短于 BLOCK_SIZE）
+            int inBlock = (int) (pos - blockStart);
+            int avail = storedLen - inBlock;
+            if (avail <= 0) {
+                throw new EOFException("block " + hash + " is truncated");
+            }
+            int take = Math.min(avail, remain);
+            readAt(hash, location[0] + inBlock, block, take);
+            System.arraycopy(block, 0, out, dest, take);
+            pos += take;
+            dest += take;
+            remain -= take;
+        }
     }
 
     private long[] require(String hash, Path target) throws IOException {

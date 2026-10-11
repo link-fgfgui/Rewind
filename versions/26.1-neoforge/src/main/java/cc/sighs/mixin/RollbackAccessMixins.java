@@ -18,7 +18,9 @@ import net.minecraft.server.level.GenerationChunkHolder;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.entity.raid.Raids;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.EntityStorage;
 import net.minecraft.world.level.chunk.storage.IOWorker;
 import net.minecraft.world.level.chunk.storage.RegionFile;
@@ -31,6 +33,8 @@ import net.minecraft.world.level.entity.PersistentEntitySectionManager;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
 import net.minecraft.world.level.storage.SavedDataStorage;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.resources.Identifier;
 import net.neoforged.neoforge.attachment.AttachmentHolder;
 import net.neoforged.neoforge.attachment.AttachmentType;
 import org.spongepowered.asm.mixin.Mixin;
@@ -87,6 +91,18 @@ public final class RollbackAccessMixins {
         /** 排空卸载队列：把 toDrop 里的 holder 真的丢掉（含原版的卸载收尾）。 */
         @Invoker("processUnloads")
         void rewind$processUnloads(BooleanSupplier supplier);
+
+        /**
+         * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：强制标脏收尾时，
+         * 对“回滚影响过、但此时不在可见集合或已被卸载”的离线区块补齐落盘，
+         * 不依赖 {@code saveAllChunks} 的可见性/冷却过滤。
+         */
+        @Invoker("save")
+        boolean rewind$saveDirect(ChunkAccess chunk);
+
+        /** 兴趣点管理器：丢弃窗口内先 {@code flush} 清脏再取消，避免 POI 脏标记漏网。 */
+        @Accessor("poiManager")
+        PoiManager rewind$poiManager();
 
         @Accessor("toDrop")
         LongSet rewind$toDrop();
@@ -216,6 +232,22 @@ public final class RollbackAccessMixins {
     public interface SavedDataStorageAccess {
         @Accessor("cache")
         Map<SavedDataType<?>, Optional<SavedData>> rewind$cache();
+
+        /** 该存储的数据目录（写监听按保存文件、读拦截按绝对路径拼出同一把覆盖键）。 */
+        @Accessor("dataFolder")
+        Path rewind$dataFolder();
+
+        /** 反序列化快照 NBT 要用它（读拦截在覆盖命中时直接构造实例，不走磁盘）。 */
+        @Accessor("registries")
+        HolderLookup.Provider rewind$registries();
+
+        /** 所属维度（服务器级存储为 null）：读拦截按原版 {@code readSavedData} 同款解码用。 */
+        @Accessor("level")
+        ServerLevel rewind$level();
+
+        /** 写监听按类型算出落盘路径（与原版 {@code tryWrite} 同款），与读拦截的键一致。 */
+        @Invoker("getDataFile")
+        Path rewind$getDataFile(Identifier id);
     }
 
     /**

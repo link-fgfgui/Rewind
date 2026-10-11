@@ -1,10 +1,13 @@
 package cc.sighs;
 
 import cc.sighs.rewind.client.RewindClient;
+import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.spi.RewindPlatforms;
 import cc.sighs.rewind.server.ForgeRewindPlatform;
 import cc.sighs.rewind.server.RewindServerConfig;
 import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
@@ -47,5 +50,7 @@ public final class RewindForge {
         if (FMLEnvironment.dist == Dist.CLIENT) {
             RewindClient.setup(modBus);
         }
+        // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
+        MinecraftForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> RewindState.onWorldUnloaded());
     }
 }

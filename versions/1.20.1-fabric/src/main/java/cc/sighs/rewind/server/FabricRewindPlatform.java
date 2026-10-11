@@ -1,10 +1,19 @@
 package cc.sighs.rewind.server;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.file.Path;
+import cc.sighs.rewind.common.spi.EncodedSector;
 import cc.sighs.rewind.common.spi.FlushOutcome;
 import cc.sighs.rewind.common.spi.RewindPlatform;
 import cc.sighs.rewind.common.spi.RollbackOutcome;
+import cc.sighs.rewind.common.spi.StorageKind;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import net.minecraft.world.level.storage.LevelResource;
 
 /**
@@ -80,5 +89,75 @@ public final class FabricRewindPlatform implements RewindPlatform {
 
     private static MinecraftServer server(Object server) {
         return (MinecraftServer) server;
+    }
+
+    /**
+     * 写账本 NBT → 扇区负载：DEFLATE 压缩（解码器按头版本分派，重压成 DEFLATE 依然合法）。
+     *
+     * <p>与原版 {@code RegionFileStorage.write} 的压缩路径同构（{@code NbtIo.write} 进
+     * 版本包装流），只是不经过文件。要求入参是纯数据（调用方已 {@code copy()} 过）。
+     */
+    @Override
+    public EncodedSector encodeChunkSector(Object tag) {
+        if (!(tag instanceof CompoundTag)) {
+            return null;
+        }
+        try {
+            ByteArrayOutputStream raw = new ByteArrayOutputStream(8192);
+            try (DataOutputStream out =
+                    new DataOutputStream(RegionFileVersion.VERSION_DEFLATE.wrap(raw))) {
+                NbtIo.write((CompoundTag) tag, out);
+            }
+            return new EncodedSector(RegionFileVersion.VERSION_DEFLATE.getId(), raw.toByteArray());
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** 扇区负载字节 → 写账本句柄（回滚灌装用）。 */
+    @Override
+    public Object decodeChunkSector(byte[] uncompressed) {
+        if (uncompressed == null) {
+            return null;
+        }
+        try (DataInputStream in = new DataInputStream(new java.io.ByteArrayInputStream(uncompressed))) {
+            return NbtIo.read(in);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * （种类，维度）→ region 目录相对路径。1.20.1 的维度存储目录：
+     * 主世界直接是 {@code region/}，下界/末地是 {@code DIM-1/region/}、{@code DIM1/region/}；
+     * 实体/POI 同理。模组自定义维度若用了别的布局，存档文件夹惯例对不上就返回 null
+     * （增量建点对这些条目回退磁盘扫描，绝不硬猜）。
+     */
+    @Override
+    public String chunkDirRelative(StorageKind kind, String dimensionId) {
+        String leaf;
+        switch (kind) {
+            case CHUNK:
+                leaf = "region";
+                break;
+            case ENTITY:
+                leaf = "entities";
+                break;
+            case POI:
+                leaf = "poi";
+                break;
+            default:
+                return null;
+        }
+        if ("minecraft:overworld".equals(dimensionId)) {
+            return leaf;
+        }
+        if ("minecraft:the_nether".equals(dimensionId)) {
+            return "DIM-1/" + leaf;
+        }
+        if ("minecraft:the_end".equals(dimensionId)) {
+            return "DIM1/" + leaf;
+        }
+        return null;
     }
 }

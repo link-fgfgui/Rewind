@@ -30,16 +30,17 @@ import cc.sighs.mixin.RollbackAccessMixins.ServerChunkCacheAccess;
 import cc.sighs.mixin.RollbackAccessMixins.ServerLevelAccess;
 import cc.sighs.mixin.RollbackAccessMixins.SimpleRegionStorageAccess;
 import cc.sighs.rewind.Rewind;
+import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.compat.SophisticatedCoreCompat;
-import cc.sighs.rewind.common.config.RollbackSettings;
 import cc.sighs.rewind.common.core.SavedDataRollback;
+import cc.sighs.rewind.common.spi.StorageKind;
+import cc.sighs.rewind.common.spi.StorageOverlay;
 import cc.sighs.rewind.common.store.SnapshotBlockIo;
 import cc.sighs.rewind.snapshot.RegionHeader;
 import cc.sighs.rewind.snapshot.SnapshotBlockStore;
 import cc.sighs.rewind.snapshot.SnapshotBlocks;
+import cc.sighs.rewind.snapshot.SnapshotChunkDecoder;
 import cc.sighs.rewind.snapshot.SnapshotLayout;
-import cc.sighs.rewind.snapshot.SnapshotManifest;
-import cc.sighs.rewind.snapshot.SnapshotMirror;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
@@ -69,7 +70,6 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.chunk.storage.EntityStorage;
 import net.minecraft.world.level.chunk.storage.IOWorker;
-import net.minecraft.world.level.chunk.storage.RegionFile;
 import net.minecraft.world.level.chunk.storage.RegionFileStorage;
 import net.minecraft.world.level.chunk.storage.SimpleRegionStorage;
 import net.minecraft.world.level.dimension.end.EnderDragonFight;
@@ -101,21 +101,23 @@ import net.neoforged.neoforge.attachment.LevelAttachmentsSavedData;
  *
  * <p>顺序与依据：
  * <ol>
- *   <li><b>找受影响区块</b>：遍历当前加载的区块，判据是「内存里改过还没落盘」或者「它所在 region
- *       文件的 per-chunk 偏移/时间戳与快照里不一致」。用 .mca 头部的 8 KiB 表做逐区块比对，
- *       所以代价与「真正改了多少区块」成正比，而不是与视距成正比。</li>
+ *   <li><b>找受影响区块</b>：直接用写盘监听账本的精确变更集（建点之后写过的坐标），
+ *       加上内存判据（未落盘的改动 / 未保存的实体）与快照实体判据。对 {@code /saves}
+ *       活文件 0 读取。代价与「真正改了多少区块」成正比，而不是与视距成正比。</li>
  *   <li><b>强制卸载</b>：把这些区块的 ticket level 顶到 {@code ChunkLevel.MAX_LEVEL + 1}，再推进
- *       原版的卸载流水线。此时回滚窗口是开着的，卸载触发的落盘会被跳过——内存里这些状态本来就要被覆盖。</li>
- *   <li><b>释放 region 句柄</b>：Windows 上打开着的 .mca 会锁住文件，覆盖之前必须关掉。原版
- *       {@code RegionFileStorage.close()} 只关不清缓存，所以这里关完直接清空缓存，让存储层下次访问时
- *       重新打开（顺便重新读被还原过的头部）。</li>
- *   <li><b>回拷文件</b>：复用 {@link SnapshotMirror} 的反向增量：只有建点之后真正被改写过的文件才会
- *       被拷回来，其余文件本来就还是存档点内容。</li>
- *   <li><b>重载</b>：给卸载掉的区块重建 holder，让它们从（已还原的）磁盘读回来；原版的发送流水线
- *       会自动把新数据推给客户端。</li>
- *   <li><b>内存状态</b>：玩家 / 世界时间单独还原；每个维度与服务器级的存档数据缓存里，**能重新读盘**的条目
- *       整体作废、从（已还原的）磁盘重读，而**被长生命周期对象用字段强引用**的那些故意保留（见
- *       {@link #PROTECTED_SAVED_DATA}）；其中袭击、记分板、天气、等级数据附件显式重建。</li>
+ *       原版的卸载流水线。此时回滚窗口是开着的，卸载触发的落盘会被跳过——内存里这些状态本来就要被覆盖；
+ *       POI 脏标记先清后弃，不漏网。</li>
+ *   <li><b>灌装覆盖层</b>：直接从快照块存储按坐标解出扇区（严格头截断与版本分派，含
+ *       {@code .mcc} 外溢），写前冻结基底优先，存档数据/玩家数据从槽位目录读入。
+ *       对 {@code /saves} 活文件 0 读取；存储句柄不关（Windows 文件锁问题自然消失）。</li>
+ *   <li><b>重载</b>：给卸载掉的区块重建 holder，读拦截稀疏短路喂出快照数据
+ *       （未覆盖的区域穿透走盘）；原版的发送流水线会自动把新数据推给客户端。
+ *       全部同步读回，不设视野外延迟（覆盖层撤装即清，延迟会错过覆盖）。</li>
+ *   <li><b>内存状态</b>：玩家 / 时间天气单独还原（纯内存，不碰盘）；每个维度与服务器级的存档数据
+ *       缓存整体作废、经读拦截从覆盖层重读，其中「被长生命周期对象强引用」的那几个
+ *       （袭击、记分板、天气、等级数据附件）显式重建。</li>
+ *   <li><b>强制标脏</b>：遍历回滚目标显式标脏并刷新可访问性，存档数据全部标脏，
+ *       再显式直写一遍——启动自然持久化收敛，退出世界时原版落盘自动带走快照内容。</li>
  * </ol>
  *
  * <p>已知边界（比「关世界再重开」那条路少了什么）：**磁盘**与「每次用时 {@code SavedDataStorage.get}
@@ -166,9 +168,10 @@ public final class InPlaceRollback {
         public int affectedChunks;
         public int unloadedChunks;
         public int reloadedChunks;
-        /** 视野外、交给原版流水线异步读回来的区块数。 */
+        /** 视野外、交给原版流水线异步读回来的区块数（零磁盘架构下恒为 0：全部同步读回）。 */
         public int deferredChunks;
         public int stuckChunks;
+        /** 对 `/saves` 的读/写次数（零磁盘架构的验收口：恒为 0）。 */
         public int closedRegionFiles;
         public String mirror = "";
         public int mirrorCopied;
@@ -177,8 +180,6 @@ public final class InPlaceRollback {
         public int restoredPlayers;
         public boolean restoredWorldData;
         public long unloadMs;
-        public long storageMs;
-        public long copyMs;
         public long reloadMs;
         public long stateMs;
         public long totalMs;
@@ -192,6 +193,13 @@ public final class InPlaceRollback {
         public long settleMs;
         public long stateWorldMs;
         public long statePlayersMs;
+        public long forceDirtyMs;
+        /** 覆盖层：灌装成功的区块数。 */
+        public int coverPopulated;
+        /** 覆盖层：灌装耗时。 */
+        public long coverMs;
+        /** 覆盖层：重载命中的读次数。 */
+        public long coverHits;
 
         public String summary() {
             return "chunks=" + affectedChunks + "/" + scannedChunks
@@ -199,12 +207,9 @@ public final class InPlaceRollback {
                     + " reloaded=" + reloadedChunks
                     + (deferredChunks == 0 ? "" : " deferred=" + deferredChunks)
                     + (stuckChunks == 0 ? "" : " stuck=" + stuckChunks)
-                    + " closedRegions=" + closedRegionFiles
                     + " players=" + restoredPlayers
                     + " worldData=" + (restoredWorldData ? "yes" : "no")
                     + " unloadMs=" + unloadMs
-                    + " storageMs=" + storageMs
-                    + " copyMs=" + copyMs
                     + " reloadMs=" + reloadMs
                     + " stateMs=" + stateMs
                     + " totalMs=" + totalMs
@@ -215,6 +220,7 @@ public final class InPlaceRollback {
                     + " holders=" + holdersMs
                     + " load=" + loadMs
                     + " settle=" + settleMs
+                    + " forceDirty=" + forceDirtyMs
                     + " stateWorld=" + stateWorldMs
                     + " statePlayers=" + statePlayersMs + "]"
                     + " mirror[" + mirror + "]";
@@ -246,29 +252,31 @@ public final class InPlaceRollback {
     public static Result run(MinecraftServer server, Path worldRoot, String slot) throws Exception {
         Result result = new Result();
         long startedNanos = System.nanoTime();
-        // 回滚窗口先关掉，而且要在做任何别的事之前。RewindApi 在调进来之前就把它打开了，而窗口开着的时候
-        // RegionFileStorage.write 会被整段取消（见 RollbackDiscardMixins）。26.1 的 ChunkMap.saveChunksEagerly
-        // 会先把区块的 unsaved 标记清掉、再异步落盘，如果这次异步写正好落在这个窗口里，它就被静默丢掉：
-        // 内存里「已经不脏」、磁盘上「也没变」，这个区块从两个判据里同时消失，回滚当它没改过——表现为
-        // 「世界回滚成功了，但某个区块原样留在改后的状态」。
-        // 所以窗口只留到真正开始覆盖文件之前（下面的 beginDiscard 重新打开），中间这一段
-        // （读槽位清单 / 追平写入 / 找受影响区块）必须让写入正常落地。
-        Rewind.endDiscard();
         Path slotDir = SnapshotLayout.slotDir(worldRoot, slot);
-        SnapshotManifest manifest = SnapshotManifest.load(SnapshotLayout.manifestFile(worldRoot, slot));
+        // 覆盖层灌了多少区块（finally 里连命中数一起记一行日志，稀疏拦截的验收口）。
+        int coveredChunks = 0;
 
         try {
             // 先把「已经排队但还没落盘」的写入落下去：这类区块在内存里已经不是 unsaved、磁盘上又还没变，
             // 两个判据都会漏掉它。这段时间世界不会 tick（我们就在服务端线程上），所以不会再有新的写入插进来。
+            // 回滚窗口先关掉，而且要在做任何别的事之前。RewindApi 在调进来之前就把它打开了，而窗口开着的时候
+            // RegionFileStorage.write 会被整段取消。26.1 的 ChunkMap.saveChunksEagerly
+            // 会先把区块的 unsaved 标记清掉、再异步落盘，如果这次异步写正好落在这个窗口里，它就被静默丢掉：
+            // 内存里「已经不脏」、磁盘上「也没变」，这个区块从两个判据里同时消失，回滚当它没改过——表现为
+            // 「世界回滚成功了，但某个区块原样留在改后的状态」。
+            // 所以窗口只留到真正开始覆盖文件之前（下面的 beginDiscard 重新打开），中间这一段
+            // （读槽位清单 / 追平写入 / 找受影响区块）必须让写入正常落地。
+            Rewind.endDiscard();
             flushWorkers(server);
             Rewind.beginDiscard();
 
             long stepNanos = System.nanoTime();
             SnapshotBlocks snapshotBlocks = SnapshotBlocks.load(SnapshotLayout.blockMapFile(worldRoot, slot));
-            // 快照里块编码的 .mca 没有实体文件，读它的头部要过一个块存储会话；用完就关
+            // 快照里块编码的 .mca 没有实体文件，读它的头部/扇区要过一个块存储会话；用完就关。
+            // collectTargets 只读内存账本与快照（允许），对 /saves 活文件 0 读取。
             List<Target> targets;
             try (SnapshotBlockStore headerStore = SnapshotBlockIo.openStore(worldRoot)) {
-                targets = collectTargets(server, worldRoot, slotDir, headerStore, snapshotBlocks, result);
+                targets = collectTargets(server, slotDir, headerStore, snapshotBlocks, result);
             }
             result.collectMs = millisSince(stepNanos);
 
@@ -291,17 +299,19 @@ public final class InPlaceRollback {
             result.cacheMs = millisSince(subNanos);
             result.unloadMs = millisSince(stepNanos);
 
+            // 零磁盘回滚：不关存储句柄（Windows 文件锁问题自然消失），不回拷文件。
+            // 覆盖层在这里灌好并武装，后面重建与重载读到的就是检查点数据；
+            // 未被备份/未改动的区域不在覆盖层内，自然穿透走盘，二者零冲突。
             stepNanos = System.nanoTime();
-            result.closedRegionFiles = closeStorageHandles(server);
-            result.storageMs = millisSince(stepNanos);
-
-            stepNanos = System.nanoTime();
-            SnapshotMirror.Result mirror = SnapshotBlockIo.restoreInto(worldRoot, slot, manifest);
-            result.mirror = mirror.summary();
-            result.mirrorCopied = mirror.copied;
-            result.mirrorSkipped = mirror.skipped;
-            result.mirrorFiles = mirror.files.size();
-            result.copyMs = millisSince(stepNanos);
+            List<String> dataFiles;
+            try (SnapshotBlockStore coverStore = SnapshotBlockIo.openStore(worldRoot)) {
+                dataFiles = populateCover(server, slotDir, snapshotBlocks, coverStore, targets, result);
+                coveredChunks = result.coverPopulated;
+            }
+            result.coverMs = millisSince(stepNanos);
+            RewindState.armStorageCover();
+            Rewind.LOGGER.info("Rewind: storage cover populated ({} chunks) in {} ms",
+                    coveredChunks, result.coverMs);
 
             stepNanos = System.nanoTime();
             recreateHolders(server, targets, result);
@@ -322,12 +332,22 @@ public final class InPlaceRollback {
             result.reloadMs += millisSince(stepNanos);
 
             try {
-                // 传入 mirror 是为了把这次回滚覆盖到的存档数据文件打进日志（见 SavedDataRollback.report）
-                restoreSavedData(server, mirror);
+                restoreSavedData(server, dataFiles);
             } catch (Throwable t) {
                 Rewind.LOGGER.error("Rewind: failed to reload saved data in place", t);
             }
+
+            stepNanos = System.nanoTime();
+            forceDirty(server, targets);
+            result.forceDirtyMs = millisSince(stepNanos);
         } finally {
+            // 先撤装再开写：撤装连账本一起清（回滚完成=新基线，之后重记）。
+            // 命中数是稀疏拦截的验收口——大于 0 说明重载真的走了覆盖层。
+            long coverHits = RewindState.storageJournal().serveHits() + RewindState.dataCover().serveHits();
+            result.coverHits = coverHits;
+            RewindState.disarmStorageCover();
+            Rewind.LOGGER.info("Rewind: storage cover served {} reads ({} chunks covered)",
+                    coverHits, coveredChunks);
             // 回滚窗口一直开到整段结束：这期间任何落盘都是要被丢弃的（实体卸载的收尾写入尤其危险）
             Rewind.clearUnloadGuards();
             Rewind.endDiscard();
@@ -340,33 +360,33 @@ public final class InPlaceRollback {
     // ------------------------------------------------------------------ 1. 找受影响区块
 
     /**
-     * 判据（任一成立就算受影响）：
+     * 精确变更集判据（任一成立就算受影响），对 {@code /saves} 活文件 0 读取：
      * <ul>
+     *   <li>写盘监听账本覆盖了该（种类，维度，坐标）——建点之后改过且已落盘或排队中。
+     *       这条替代了老路的 {@code .mca} 头部 8 KiB 比对。</li>
      *   <li>{@code isUnsaved()}：内存里改过还没落盘（方块 / 方块实体 / 光照 / 计划刻 / 结构都会置这个位）。</li>
-     *   <li>区块 region 文件的 per-chunk 偏移/时间戳与快照不一致（改过且已经落盘）。</li>
-     *   <li>实体或 POI 的 region 文件同样不一致（落过盘的实体改动）。</li>
      *   <li>内存里还有「会被保存的实体」，或者快照里这个区块本来有实体。
      *       这条是实体回滚的关键：实体存储没有 per-chunk 脏标记，新放的实体在自动保存之前
-     *       磁盘上完全看不出来，只能靠内存状态判断。</li>
+     *       磁盘上完全看不出来，只能靠内存状态判断。快照侧读的是槽位块存储（允许），
+     *       不碰活文件。</li>
      * </ul>
-     * 所以代价与「真正改了多少区块」成正比，与视距无关。
+     * 代价与「真正改了多少区块」成正比，与视距无关。账本里有、但此时已不在内存的坐标
+     * （改过之后又被卸载）同样纳入——灌装时从快照解码，重建时强制读回。
      */
-    private static List<Target> collectTargets(MinecraftServer server, Path worldRoot, Path slotDir,
+    private static List<Target> collectTargets(MinecraftServer server, Path slotDir,
             SnapshotBlockStore store, SnapshotBlocks blocks, Result result) throws IOException {
         List<Target> targets = new ArrayList<>();
+        Set<String> added = new HashSet<>();
         Map<Path, int[]> headerCache = new HashMap<>();
         for (ServerLevel level : server.getAllLevels()) {
+            String dimensionId = level.dimension().identifier().toString();
             ChunkMap chunkMap = level.getChunkSource().chunkMap;
-            List<Path> liveDirs = liveRegionDirs(level);
-            List<Path> snapshotDirs = new ArrayList<>(liveDirs.size());
-            for (Path liveDir : liveDirs) {
-                snapshotDirs.add(slotDir.resolve(SnapshotLayout.relativize(worldRoot, liveDir)));
-            }
+            List<Path> snapshotDirs = snapshotRegionDirs(server, level, slotDir);
             EntitySectionStorage<Entity> sections = entityManagerAccess(level).rewind$sectionStorage();
             // 26.1 删掉了 ChunkMap.getChunks()，直接读 visibleChunkMap（它原本就是那个方法的数据源）
             for (ChunkHolder holder : mapAccess(chunkMap).rewind$visibleChunks().values()) {
                 if (holder.getTicketLevel() > ChunkLevel.MAX_LEVEL) {
-                    // 已经在卸载路上：内存里的内容马上就会自己丢掉，磁盘上会被快照覆盖，不用管
+                    // 已经在卸载路上：内存里的内容马上就会自己丢掉，不用管
                     continue;
                 }
                 if (!(holder.getLatestChunk() instanceof LevelChunk chunk)) {
@@ -374,16 +394,71 @@ public final class InPlaceRollback {
                 }
                 result.scannedChunks++;
                 ChunkPos pos = chunk.getPos();
-                if (chunk.isUnsaved()
-                        || regionChunkChanged(store, slotDir, blocks, liveDirs, snapshotDirs, pos, headerCache)
+                long key = pos.pack();
+                if (journalCovers(dimensionId, key)
+                        || chunk.isUnsaved()
                         || hasSaveableEntities(sections, pos)
                         || snapshotHasEntities(store, slotDir, blocks, snapshotDirs, pos, headerCache)) {
                     targets.add(new Target(level, pos));
+                    added.add(keyFor(dimensionId, key));
                 }
             }
         }
+        // 账本里有、但已不在内存的坐标（改后卸载）：同样接管，重建时强制读回
+        for (StorageOverlay.Entry entry : RewindState.storageJournal().entries()) {
+            ServerLevel level = levelOf(server, entry.dimensionId);
+            if (level == null) {
+                continue;
+            }
+            String mapKey = keyFor(entry.dimensionId, entry.chunkPos);
+            if (added.contains(mapKey)) {
+                continue;
+            }
+            ChunkMap chunkMap = level.getChunkSource().chunkMap;
+            if (chunkMap.getUpdatingChunkIfPresent(entry.chunkPos) != null) {
+                continue;
+            }
+            targets.add(new Target(level, ChunkPos.unpack(entry.chunkPos)));
+            added.add(mapKey);
+            result.scannedChunks++;
+        }
         result.affectedChunks = targets.size();
         return targets;
+    }
+
+    /** 写账本有没有记过该（维度，坐标）（任一种类都算）。 */
+    private static boolean journalCovers(String dimensionId, long chunkPos) {
+        return RewindState.storageJournal().covers(StorageKind.CHUNK, dimensionId, chunkPos)
+                || RewindState.storageJournal().covers(StorageKind.ENTITY, dimensionId, chunkPos)
+                || RewindState.storageJournal().covers(StorageKind.POI, dimensionId, chunkPos);
+    }
+
+    /** 同一坐标在不同维度是不同条目：去重键带上维度。 */
+    private static String keyFor(String dimensionId, long chunkPos) {
+        return dimensionId + "|" + chunkPos;
+    }
+
+    private static ServerLevel levelOf(MinecraftServer server, String dimensionId) {
+        for (ServerLevel level : server.getAllLevels()) {
+            if (level.dimension().identifier().toString().equals(dimensionId)) {
+                return level;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 该维度三类存储在槽位里的目录（与 {@code liveRegionDirs} 同序：区块 / 实体 / POI，
+     * 相对槽位根）。只做路径拼接，不读盘。
+     */
+    private static List<Path> snapshotRegionDirs(MinecraftServer server, ServerLevel level, Path slotDir) {
+        Path worldRoot = server.getWorldPath(LevelResource.LEVEL_DATA_FILE).getParent();
+        List<Path> liveDirs = liveRegionDirs(level);
+        List<Path> snapshotDirs = new ArrayList<>(liveDirs.size());
+        for (Path liveDir : liveDirs) {
+            snapshotDirs.add(slotDir.resolve(SnapshotLayout.relativize(worldRoot, liveDir)));
+        }
+        return snapshotDirs;
     }
 
     /** 内存里这个区块还有没有会被保存的实体（玩家不算，{@code Player.shouldBeSaved()} 为 false）。 */
@@ -433,20 +508,219 @@ public final class InPlaceRollback {
         return storage == null ? null : simpleRegionStorageAccess(storage).rewind$worker();
     }
 
-    /** 任意一个存储里这个区块的偏移/时间戳与快照不一致就算变过。 */
-    private static boolean regionChunkChanged(SnapshotBlockStore store, Path slotDir, SnapshotBlocks blocks,
-            List<Path> liveDirs, List<Path> snapshotDirs, ChunkPos pos, Map<Path, int[]> cache) throws IOException {
-        String name = regionFileName(pos);
-        int index = (pos.x() & 31) + (pos.z() & 31) * 32;
-        int count = Math.min(liveDirs.size(), snapshotDirs.size());
-        for (int i = 0; i < count; i++) {
-            int[] live = RegionHeader.read(cache, liveDirs.get(i).resolve(name));
-            int[] snapshot = RegionHeader.fromSnapshot(cache, store, slotDir, blocks, snapshotDirs.get(i), name);
-            if (live[index] != snapshot[index] || live[1024 + index] != snapshot[1024 + index]) {
-                return true;
+    /**
+     * 内存直解灌装：把受影响区块的检查点数据从快照直接解进账本。
+     *
+     * <p>对 {@code /saves} 活文件 <b>0 读取</b>：区块扇区走快照块存储（
+     * {@code SnapshotChunkDecoder}，严格按 5 字节头截断与版本分派，含 {@code .mcc}
+     * 外溢），写前冻结基底优先（冷区块快照数据，未进块存储的不走解码），
+     * 存档数据/玩家数据走槽位目录的 {@code .dat}（快照目录，允许）。
+     * 老格式槽位（整文件、无块映射）回退读槽位整文件——同样是快照目录，不碰活文件。
+     * 快照里不存在的区块记删除标记：读拦截短路喂空，不放行走盘（否则把删掉的区块复活）。
+     * 单个区块解码失败只跳过该区块（记一行日志），不炸整段回滚。
+     *
+     * @return 本次覆盖到的存档数据文件相对路径（给存档数据回滚打日志用）
+     */
+    private static List<String> populateCover(MinecraftServer server, Path slotDir, SnapshotBlocks blocks,
+            SnapshotBlockStore store, List<Target> targets, Result result) {
+        int covered = 0;
+        List<String> dataFiles = new ArrayList<>();
+        for (Map.Entry<ServerLevel, List<ChunkPos>> entry : targetsByLevel(targets).entrySet()) {
+            covered += populateCoverForLevel(slotDir, blocks, store, entry.getKey(), entry.getValue());
+        }
+        covered += populateDataCover(server, slotDir, dataFiles);
+        result.coverPopulated = covered;
+        result.mirror = "cover=" + covered;
+        result.mirrorCopied = covered;
+        result.mirrorSkipped = 0;
+        result.mirrorFiles = targets.size();
+        return dataFiles;
+    }
+
+    private static Map<ServerLevel, List<ChunkPos>> targetsByLevel(List<Target> targets) {
+        Map<ServerLevel, List<ChunkPos>> byLevel = new LinkedHashMap<>();
+        for (Target target : targets) {
+            byLevel.computeIfAbsent(target.level, level -> new ArrayList<>()).add(target.pos);
+        }
+        return byLevel;
+    }
+
+    private static int populateCoverForLevel(Path slotDir, SnapshotBlocks blocks,
+            SnapshotBlockStore store, ServerLevel level, List<ChunkPos> poses) {
+        NeoForge261RewindPlatform platform = new NeoForge261RewindPlatform();
+        String dimensionId = level.dimension().identifier().toString();
+        int covered = 0;
+        StorageKind[] kinds = {StorageKind.CHUNK, StorageKind.ENTITY, StorageKind.POI};
+        for (StorageKind kind : kinds) {
+            String dir = platform.chunkDirRelative(kind, dimensionId);
+            if (dir == null) {
+                Rewind.LOGGER.warn("Rewind: unknown storage layout for {} in {}, skipping cover for it",
+                        kind, dimensionId);
+                continue;
+            }
+            for (ChunkPos pos : poses) {
+                if (populateCoverForChunk(slotDir, blocks, store, platform,
+                        dir, kind, dimensionId, pos)) {
+                    covered++;
+                }
             }
         }
-        return false;
+        return covered;
+    }
+
+    private static boolean populateCoverForChunk(Path slotDir, SnapshotBlocks blocks,
+            SnapshotBlockStore store, NeoForge261RewindPlatform platform,
+            String dir, StorageKind kind, String dimensionId, ChunkPos pos) {
+        // 写前冻结优先：冷区块在建点后第一次被改写前留下的基底，本身就是快照数据
+        Object frozen = RewindState.frozenBase(kind, dimensionId, pos.pack());
+        if (frozen instanceof CompoundTag) {
+            RewindState.storageJournal().onWritten(kind, dimensionId, pos.pack(), ((CompoundTag) frozen).copy());
+            return true;
+        }
+        String mcaRelative = SnapshotLayout.normalize(dir + "/" + regionFileName(pos));
+        try {
+            SnapshotChunkDecoder.Sector sector;
+            byte[] externalPayload = null;
+            SnapshotBlocks.Entry entry = blocks.get(mcaRelative);
+            if (entry != null) {
+                sector = SnapshotChunkDecoder.readSector(store, blocks, mcaRelative, pos.x(), pos.z());
+                if (sector != null && sector.external) {
+                    String mccRelative = SnapshotChunkDecoder.mccRelative(mcaRelative, pos.x(), pos.z());
+                    externalPayload = SnapshotChunkDecoder.readExternalPayload(store, blocks, mccRelative);
+                }
+            } else {
+                Path slotFile = slotDir.resolve(mcaRelative);
+                sector = SnapshotChunkDecoder.readSectorFromFile(slotFile, pos.x(), pos.z());
+                if (sector != null && sector.external) {
+                    Path slotMcc = slotDir.resolve(SnapshotChunkDecoder.mccRelative(mcaRelative, pos.x(), pos.z()));
+                    externalPayload = SnapshotChunkDecoder.readExternalPayloadFromFile(slotMcc);
+                }
+            }
+            if (sector == null) {
+                // 快照里没有这个区块：记删除标记，读拦截短路喂空
+                RewindState.storageJournal().onWritten(kind, dimensionId, pos.pack(), null);
+                return true;
+            }
+            byte[] uncompressed = sector.external
+                    ? SnapshotChunkDecoder.decompress(sector.versionId, externalPayload)
+                    : SnapshotChunkDecoder.decompress(sector.versionId, sector.compressed);
+            Object tag = platform.decodeChunkSector(uncompressed);
+            if (tag == null) {
+                Rewind.LOGGER.warn("Rewind: cannot decode checkpoint chunk {} from {}, skipping cover for it",
+                        pos, mcaRelative);
+                return false;
+            }
+            RewindState.storageJournal().onWritten(kind, dimensionId, pos.pack(), tag);
+            return true;
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: cannot read checkpoint chunk {} from {}, skipping cover for it",
+                    pos, mcaRelative, t);
+            return false;
+        }
+    }
+
+    /**
+     * 非区块 NBT 灌装：把槽位的 {@code .dat} 读进数据覆盖层（快照目录，允许）。
+     *
+     * <p>存档数据按“活文件绝对路径”拼键（与读写两端的键一致）：每个存储的
+     * {@code SavedDataStorage} 数据目录（含服务器级那一份，26.1 落成
+     * {@code <dataFolder>/<命名空间>/<路径>.dat}）在槽位里找同名 {@code .dat}，
+     * 有就读入覆盖，没有就记删除标记（回滚后懒加载不再复活未来文件）。
+     * 玩家数据只灌在线玩家的（离线玩家走登录时读盘，届时覆盖已撤——与区块冷加载不同，
+     * 玩家登录必经服务端线程，可单独对账；缺席同样记删除标记）。
+     *
+     * @return 灌装计数；dataFiles 收集本次覆盖到的存档数据文件相对路径（世界根基准，给日志用）
+     */
+    private static int populateDataCover(MinecraftServer server, Path slotDir, List<String> dataFiles) {
+        int covered = 0;
+        Path worldRoot = server.getWorldPath(LevelResource.LEVEL_DATA_FILE).getParent();
+        Set<String> seenDataKeys = new HashSet<>();
+        List<SavedDataStorage> storages = new ArrayList<>();
+        for (ServerLevel level : server.getAllLevels()) {
+            storages.add(level.getDataStorage());
+        }
+        storages.add(server.getDataStorage());
+        for (SavedDataStorage storage : storages) {
+            Path liveDir = storageAccess(storage).rewind$dataFolder();
+            if (liveDir == null) {
+                continue;
+            }
+            Path slotDataDir;
+            try {
+                slotDataDir = slotDir.resolve(SnapshotLayout.relativize(worldRoot, liveDir));
+            } catch (Throwable t) {
+                continue;
+            }
+            // 槽位里有的 .dat：读入覆盖；活文件有、槽位没有的：同样要处理（删除标记），
+            // 否则回滚后懒加载读到未来文件。目录枚举只做 readdir（不读内容），代价可忽略。
+            // 26.1 是嵌套布局（<命名空间>/<路径>.dat，可再深），递归枚举。
+            Set<String> relatives = new HashSet<>();
+            collectDatRelatives(slotDataDir, relatives);
+            collectDatRelatives(liveDir, relatives);
+            for (String relative : relatives) {
+                Path slotFile = slotDataDir.resolve(relative);
+                Path liveFile = liveDir.resolve(relative);
+                String key = cc.sighs.mixin.DataJournalMixins.savedataKey(liveFile);
+                if (!seenDataKeys.add(key)) {
+                    continue;
+                }
+                if (!Files.isRegularFile(slotFile)) {
+                    RewindState.dataCover().onWritten(key, null);
+                    continue;
+                }
+                try {
+                    CompoundTag full = NbtIo.readCompressed(slotFile, NbtAccounter.unlimitedHeap());
+                    RewindState.dataCover().onWritten(key, full.copy());
+                    covered++;
+                    try {
+                        dataFiles.add(SnapshotLayout.relativize(worldRoot, liveFile));
+                    } catch (Throwable ignored) {
+                        // 相对化失败不影响覆盖本身
+                    }
+                } catch (Throwable t) {
+                    Rewind.LOGGER.warn("Rewind: cannot read checkpoint data file {}, skipping cover for it",
+                            slotFile, t);
+                }
+            }
+        }
+        // 玩家数据：在线的按槽位读入，缺席记删除标记
+        Path relativePlayerData = worldRoot.relativize(server.getWorldPath(LevelResource.PLAYER_DATA_DIR));
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            String key = cc.sighs.mixin.DataJournalMixins.playerKey(player.getStringUUID());
+            Path slotFile = slotDir.resolve(relativePlayerData).resolve(player.getStringUUID() + ".dat");
+            if (!Files.isRegularFile(slotFile)) {
+                Path oldFile = slotDir.resolve(relativePlayerData).resolve(player.getStringUUID() + ".dat_old");
+                if (Files.isRegularFile(oldFile)) {
+                    slotFile = oldFile;
+                } else {
+                    RewindState.dataCover().onWritten(key, null);
+                    continue;
+                }
+            }
+            try {
+                CompoundTag tag = NbtIo.readCompressed(slotFile, NbtAccounter.unlimitedHeap());
+                RewindState.dataCover().onWritten(key, tag.copy());
+                covered++;
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: cannot read checkpoint player data {}, skipping cover for it",
+                        slotFile, t);
+            }
+        }
+        return covered;
+    }
+
+    /** 递归收集该目录下所有 {@code .dat} 相对路径（26.1 嵌套布局用；目录不存在即空）。 */
+    private static void collectDatRelatives(Path dir, Set<String> relatives) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> stream = Files.walk(dir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".dat"))
+                    .forEach(path -> relatives.add(dir.relativize(path).toString().replace('\\', '/')));
+        } catch (Throwable ignored) {
+            // 枚举失败就当没有
+        }
     }
 
     // ------------------------------------------------------------------ 2. 强制卸载
@@ -471,6 +745,9 @@ public final class InPlaceRollback {
             long key = target.pos.pack();
             var holder = chunkMap.getUpdatingChunkIfPresent(key);
             if (holder == null) {
+                // 改后卸载的坐标：内存里已经没有 holder，重建时强制读回（覆盖层已灌好）。
+                // ticketLevel 保持默认 0（全加载），回滚后由距离管理器自然接管。
+                target.unloaded = true;
                 continue;
             }
             int old = holder.getTicketLevel();
@@ -624,26 +901,7 @@ public final class InPlaceRollback {
         }
     }
 
-    // ------------------------------------------------------------------ 3. 释放存储句柄
-
-    /**
-     * 关掉所有 region 文件句柄（区块 / POI / 实体三条链），并把缓存清空，让存储层下次访问时重开。
-     * 关之前先把排队中的写入排空：那些写入本来就是要被覆盖掉的旧内容。
-     */
-    private static int closeStorageHandles(MinecraftServer server) {
-        int closed = 0;
-        for (ServerLevel level : server.getAllLevels()) {
-            ServerChunkCache source = level.getChunkSource();
-            closed += closeWorker(simpleRegionStorageAccess(source.chunkMap).rewind$worker());
-            closed += closeWorker(poiWorker(source.getPoiManager()));
-            Object permanent = entityManagerAccess(level).rewind$permanentStorage();
-            if (permanent instanceof EntityStorage storage) {
-                closed += closeWorker(
-                        simpleRegionStorageAccess(entityStorageAccess(storage).rewind$simpleRegionStorage()).rewind$worker());
-            }
-        }
-        return closed;
-    }
+    // ------------------------------------------------------------------ 3. 排空写入（零磁盘：句柄不关、文件不拷）
 
     private static IOWorker poiWorker(PoiManager poi) {
         SimpleRegionStorage storage = sectionStorageAccess(poi).rewind$simpleRegionStorage();
@@ -672,25 +930,6 @@ public final class InPlaceRollback {
         } catch (Throwable t) {
             Rewind.LOGGER.warn("Rewind: failed to drain pending chunk writes", t);
         }
-    }
-
-    private static int closeWorker(IOWorker worker) {
-        if (worker == null) {
-            return 0;
-        }
-        drainWorker(worker);
-        RegionFileStorage storage = ioWorkerAccess(worker).rewind$storage();
-        var cache = regionFileStorageAccess(storage).rewind$regionCache();
-        int size = cache.size();
-        for (RegionFile file : cache.values()) {
-            try {
-                file.close();
-            } catch (Throwable t) {
-                Rewind.LOGGER.warn("Rewind: failed to close a region file", t);
-            }
-        }
-        cache.clear();
-        return size;
     }
 
     // ------------------------------------------------------------------ 4. 重载
@@ -728,15 +967,16 @@ public final class InPlaceRollback {
         }
     }
 
-    /** 把重建好的区块读回来：视野内的同步读（这也是原版把新数据推给客户端的触发点），视野外交给原版流水线。 */
+    /**
+     * 把重建好的区块读回来：全部同步读（这也是原版把新数据推给客户端的触发点）。
+     *
+     * <p>零磁盘架构下不设“视野外延迟”：覆盖层在撤装时清空，延迟加载的区块会错过覆盖、
+     * 穿透读到盘上的未来数据。受影响集与“建点后改了多少”成正比，同步读完才关窗口。
+     */
     private static void loadChunks(MinecraftServer server, List<Target> targets, Result result) {
         long startedNanos = System.nanoTime();
         // 缓存里可能还留着「重建之前」的 ChunkAccess；每个维度清一次就够。
-        // 原来把它放在循环里逐区块清，等于每读回来一个就把刚读的那个踢出缓存，纯浪费。
         Set<ServerLevel> cleared = new HashSet<>();
-        // 视野半径：服务端视距 + 1 个区块，留一圈余量，免得玩家一挪就正好缺块
-        int syncRadius = server.getPlayerList().getViewDistance() + 1;
-        boolean onlyNearPlayers = RollbackSettings.syncChunksNearPlayer();
         for (Target target : targets) {
             if (!target.unloaded) {
                 continue;
@@ -748,11 +988,6 @@ public final class InPlaceRollback {
             ChunkMapAccess access = mapAccess(source.chunkMap);
             // 区块类型缓存也要作废：不然异步读回来的区块可能沿用「改世界之后」的那份类型
             access.rewind$chunkTypeCache().remove(target.pos.pack());
-            if (onlyNearPlayers && !nearAnyPlayer(server, target.level, target.pos, syncRadius)) {
-                // 不在任何玩家视野里：不在这里同步等它。ticket 已经还原，原版流水线会按需异步读回来。
-                result.deferredChunks++;
-                continue;
-            }
             try {
                 source.getChunk(target.pos.x(), target.pos.z(), ChunkStatus.FULL, true);
                 result.reloadedChunks++;
@@ -786,18 +1021,73 @@ public final class InPlaceRollback {
         result.settleMs = millisSince(settleNanos);
     }
 
-    /** 这个区块在不在任何一个玩家的视野里（按区块的切比雪夫距离算）。 */
-    private static boolean nearAnyPlayer(MinecraftServer server, ServerLevel level, ChunkPos pos, int radius) {
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() != level) {
-                continue;
-            }
-            ChunkPos playerChunk = player.chunkPosition();
-            if (Math.abs(playerChunk.x() - pos.x()) <= radius && Math.abs(playerChunk.z() - pos.z()) <= radius) {
-                return true;
+    /**
+     * 强制标脏与直写保障：启动自然持久化收敛。
+     *
+     * <p>原版只有 {@code isUnsaved()} 的区块才会落盘，且 {@code saveAllChunks} 只遍历
+     * 可见集合并检查 {@code wasAccessibleSinceLastSave}（退出世界时 {@code flush=true} 也一样）。
+     * 所以回滚重载完成后，对所有目标显式 {@code setUnsaved(true)} 并刷新可访问性；
+     * 存档数据全部 {@code setDirty(true)}。再在丢弃窗口之外显式直写一遍目标区块——
+     * 即使之后 filtered 漏写，盘上也已经是快照内容；直写走原版标准管道，
+     * 写监听自然捕获（窗口已关，记的是快照态基线），状态机自动对齐。
+     */
+    private static void forceDirty(MinecraftServer server, List<Target> targets) {
+        for (Target target : targets) {
+            try {
+                ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
+                ChunkMapAccess access = mapAccess(chunkMap);
+                var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
+                if (holder == null) {
+                    continue;
+                }
+                if (holder.getLatestChunk() instanceof LevelChunk chunk) {
+                    // 26.1：setUnsaved(boolean) 改成无参 markUnsaved()
+                    chunk.markUnsaved();
+                    holder.refreshAccessibility();
+                }
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: failed to mark chunk {} dirty after rollback", target.pos, t);
             }
         }
-        return false;
+        for (ServerLevel level : server.getAllLevels()) {
+            try {
+                for (Optional<SavedData> data : storageAccess(level.getDataStorage()).rewind$cache().values()) {
+                    data.ifPresent(d -> d.setDirty(true));
+                }
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: failed to mark saved data dirty after rollback", t);
+            }
+        }
+        try {
+            for (Optional<SavedData> data : storageAccess(server.getDataStorage()).rewind$cache().values()) {
+                data.ifPresent(d -> d.setDirty(true));
+            }
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: failed to mark server saved data dirty after rollback", t);
+        }
+        // 直写保障：丢弃窗口之外走一遍标准落盘（写监听记下快照态，时间线对齐）。
+        // 显式落盘不受 saveAllChunks 的可见性/冷却过滤影响，退出世界前盘上已是快照内容。
+        Rewind.endDiscard();
+        try {
+            for (Target target : targets) {
+                try {
+                    ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
+                    ChunkMapAccess access = mapAccess(chunkMap);
+                    var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
+                    if (holder == null) {
+                        continue;
+                    }
+                    if (holder.getLatestChunk() instanceof LevelChunk chunk) {
+                        access.rewind$saveDirect(chunk);
+                        holder.refreshAccessibility();
+                    }
+                } catch (Throwable t) {
+                    Rewind.LOGGER.warn("Rewind: failed to directly save chunk {} after rollback", target.pos, t);
+                }
+            }
+        } finally {
+            RewindState.clearStorageJournal();
+        }
     }
 
     // ------------------------------------------------------------------ 5. 内存状态
@@ -972,32 +1262,36 @@ public final class InPlaceRollback {
      * 把「内存里的存档数据」拉回存档点那一刻。
      *
      * <p>做法是**排除法**：只把不在 {@link #PROTECTED_SAVED_DATA} 里的缓存条目作废掉，之后任何
-     * {@code get} / {@code computeIfAbsent} 都会从磁盘重读（那些文件在几步之前刚被快照覆盖过）。
+     * {@code get} / {@code computeIfAbsent} 都会经读拦截从覆盖层重读（覆盖层武装中；
+     * 对 {@code /saves} 活文件 0 读取）。
      * 这样所有「每次用时取一次」的存档数据——**包括模组写在
      * {@code <维度>/data/<namespace>/<path>.dat} 里的那些**——都会自动拿到快照内容，不需要认识任何具体模组；
      * 而被长生命周期对象用字段强引用的条目原样留着，继续正常落盘（内容不参与回滚，见类注释的「已知边界」）。
      *
-     * <p>作废之后还要显式重建**能重新读盘**的那几类（它们也正是不能进 {@link #PROTECTED_SAVED_DATA} 的）：
+     * <p>作废之后还要显式重建**能从覆盖层读快照**的那几类（它们也正是不能进 {@link #PROTECTED_SAVED_DATA} 的）：
      *
      * <ul>
      *   <li><b>袭击</b>：{@code ServerLevel.raids} 是 final 字段，直接换实例；用它的 {@code SavedDataType}
-     *       走一次 {@code computeIfAbsent}，就会从（已还原的）磁盘重新读。</li>
+     *       走一次 {@code computeIfAbsent}，就会经覆盖层重新读到快照内容。</li>
      *   <li><b>等级数据附件</b>（NeoForge 的 {@code neoforge:data_attachments}）：那个 SavedData 只是个
      *       壳子，真数据挂在 {@code Level} 自己的附件表上，由它的反序列化器灌回去；而反序列化是「按 key 覆盖」
      *       而不是替换，所以要先清空那张表，快照里没有的附件才不会留下来。</li>
      *   <li><b>记分板</b>：26.1 里它挂在**服务器级**存储上（{@code server.getDataStorage()}），
      *       {@code MinecraftServer.saveAllChunks} 也是用 {@code computeIfAbsent(ScoreboardSaveData.TYPE)}
      *       拿它——作废缓存会连它一起摘掉，所以必须重建，否则 {@code SavedDataStorage.scheduleSave()} 再也
-     *       遍历不到它，scoreboard.dat 从此不再落盘。{@code storage.get} 既读出快照内容、又把条目登记回去。</li>
+     *       遍历不到它，scoreboard.dat 从此不再落盘。{@code storage.get} 既经覆盖层读出快照内容、
+     *       又把条目登记回去。</li>
      *   <li><b>天气</b>：26.1 把天气从 level.dat 搬成了服务器级 {@code WeatherData}，见
      *       {@link #restoreWeather}。必须排在缓存作废之后，否则刚重建的条目会被清掉。</li>
      * </ul>
      *
      * <p>骨架（作废 → 重建 → 记日志 → 通知模组丢缓存）在 {@link SavedDataRollback#restore}，
      * 版本相关的四处收在 {@link SavedDataHook}。
+     *
+     * @param dataFiles 本次覆盖到的存档数据文件相对路径（灌装时收集，给日志用）
      */
-    private static void restoreSavedData(MinecraftServer server, SnapshotMirror.Result mirror) {
-        SavedDataRollback.restore(new SavedDataHook(server), mirror.files);
+    private static void restoreSavedData(MinecraftServer server, List<String> dataFiles) {
+        SavedDataRollback.restore(new SavedDataHook(server), dataFiles);
     }
 
     /**

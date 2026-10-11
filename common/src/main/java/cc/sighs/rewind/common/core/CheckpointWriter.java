@@ -3,13 +3,31 @@ package cc.sighs.rewind.common.core;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import cc.sighs.rewind.common.CoverRequest;
 import cc.sighs.rewind.common.RewindLog;
+import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.compat.SophisticatedCoreCompat;
+import cc.sighs.rewind.common.spi.EncodedSector;
 import cc.sighs.rewind.common.spi.FlushOutcome;
 import cc.sighs.rewind.common.spi.RewindPlatform;
 import cc.sighs.rewind.common.spi.RewindPlatforms;
+import cc.sighs.rewind.common.spi.StorageKind;
+import cc.sighs.rewind.common.spi.StorageOverlay;
 import cc.sighs.rewind.common.store.SnapshotBlockIo;
+import cc.sighs.rewind.snapshot.AnvilDeltaAssembler;
+import cc.sighs.rewind.snapshot.SnapshotBlockStore;
+import cc.sighs.rewind.snapshot.SnapshotBlocks;
+import cc.sighs.rewind.snapshot.SnapshotChunkDecoder;
 import cc.sighs.rewind.snapshot.SnapshotIndex;
 import cc.sighs.rewind.snapshot.SnapshotInventory;
 import cc.sighs.rewind.snapshot.SnapshotLayout;
@@ -99,13 +117,14 @@ public final class CheckpointWriter {
         SnapshotInventory.of(flushed.inventory).save(SnapshotLayout.inventoryFile(world, slot));
 
         SnapshotManifest previousManifest = SnapshotManifest.load(manifestFile);
-        // region / entities / poi 的 .mca 按 4 KiB 块存：换一个槽位建点只为真正变了的扇区付字节
+        // region / entities / poi 的 .mca 按 4 KiB 块存：换一个槽位建点只为真正变了的扇区付字节。
+        // 第二个槽位起走增量：.mca 不再读 /saves（0 读），只把监听到的变更集在内存里组装进块存储；
+        // 松散文件（level.dat / playerdata / data/*.dat，几十 KB）仍走磁盘镜像。
+        // 首建点（该槽位无历史）必须全量扫描对齐，为冷区块与离线修复留完备基线。
         SnapshotMirror.Result mirror;
         SnapshotBlockIo blocks = SnapshotBlockIo.open(world, slot);
         try {
-            mirror = SnapshotMirror.mirror(
-                    world, SnapshotLayout.slotDir(world, slot), SnapshotMirror.Direction.TO_SNAPSHOT, previousManifest,
-                    null, blocks.context());
+            mirror = mirrorIncrementalOrFull(world, slot, previousManifest, blocks);
             mirror.manifest.save(manifestFile);
         } finally {
             // close() 才把这次收的块真正写进 pack
@@ -123,6 +142,9 @@ public final class CheckpointWriter {
         // 建完点，世界就站在这个节点上了：之后建的存档点都挂在它下面
         index.setHead(slot);
         index.save(indexFile);
+
+        // 基线前移：写拦截从这里开始重记「相对这个存档点改了什么」，给将来的 collectTargets 用
+        RewindState.clearStorageJournal();
 
         long millis = millisSince(startedNanos);
         RewindLog.LOGGER.info("Rewind: checkpoint {} written ({}) in {} ms", slot, mirror.summary(), millis);
@@ -157,6 +179,290 @@ public final class CheckpointWriter {
 
     private static long millisSince(long startNanos) {
         return (System.nanoTime() - startNanos) / 1_000_000L;
+    }
+
+    /**
+     * 建点的块路径二选一：首建点全量扫描，之后增量（.mca 0 读）。
+     *
+     * <p>增量条件：该槽位已有块映射，且平台已接入扇区编码与目录映射。任一不满足就回退全量——
+     * 正确性优先，代价只是多读一次盘。
+     */
+    private static SnapshotMirror.Result mirrorIncrementalOrFull(Path world, String slot,
+            SnapshotManifest previousManifest, SnapshotBlockIo blocks) throws IOException {
+        Path slotDir = SnapshotLayout.slotDir(world, slot);
+        SnapshotMirror.Blocks ctx = blocks.context();
+        // 首建点必须全量：该槽位还没有块映射（含老格式整文件槽位的迁移——全量重编码并删整文件）。
+        // 只看块映射不看清单：光有清单没有映射说明是从老版本升上来的，增量组装无底可组。
+        boolean hasHistory = ctx.existing != null && ctx.existing.size() > 0;
+        if (!hasHistory) {
+            return SnapshotMirror.mirror(world, slotDir,
+                    SnapshotMirror.Direction.TO_SNAPSHOT, previousManifest, null, ctx);
+        }
+        try {
+            SnapshotMirror.Result incremental = mirrorIncremental(world, slot, previousManifest, ctx);
+            if (incremental != null) {
+                return incremental;
+            }
+        } catch (Throwable t) {
+            RewindLog.LOGGER.warn("Rewind: incremental checkpoint failed, falling back to full scan", t);
+        }
+        return SnapshotMirror.mirror(world, slotDir,
+                SnapshotMirror.Direction.TO_SNAPSHOT, previousManifest, null, ctx);
+    }
+
+    /**
+     * 增量建点：松散文件走磁盘镜像（小文件，stat + 按需拷贝），
+     * {@code .mca/.mcc} 只用监听变更集在内存里组装（对 {@code /saves} 区块文件 0 内容读取）。
+     *
+     * <p>任一变更条目编不出（平台未接入/未知维度布局）时返回 null，调用方回退全量。
+     */
+    private static SnapshotMirror.Result mirrorIncremental(Path world, String slot,
+            SnapshotManifest previousManifest, SnapshotMirror.Blocks ctx) throws IOException {
+        RewindPlatform platform;
+        try {
+            platform = RewindPlatforms.require();
+        } catch (Throwable t) {
+            return null;
+        }
+        Path slotDir = SnapshotLayout.slotDir(world, slot);
+        SnapshotBlockStore store = ctx.store;
+        SnapshotBlocks previous = ctx.existing == null ? SnapshotBlocks.empty() : ctx.existing;
+        SnapshotBlocks written = ctx.written == null ? SnapshotBlocks.empty() : ctx.written;
+
+        List<StorageOverlay.Entry> journal = RewindState.storageJournal().entries();
+        // 按 region 文件分组：mcaRelative -> 下标 -> 账本条目
+        Map<String, Map<Integer, StorageOverlay.Entry>> byFile = new LinkedHashMap<>();
+        for (StorageOverlay.Entry e : journal) {
+            String dir = platform.chunkDirRelative(e.kind, e.dimensionId);
+            if (dir == null || dir.isEmpty()) {
+                return null;
+            }
+            long pos = e.chunkPos;
+            int[] xz = platform.unpackChunkPos(pos);
+            int x = xz[0];
+            int z = xz[1];
+            String file = SnapshotChunkDecoder.regionFileName(x, z);
+            String mcaRelative = SnapshotLayout.normalize(dir + "/" + file);
+            int index = SnapshotChunkDecoder.chunkIndex(x, z);
+            Map<Integer, StorageOverlay.Entry> group = byFile.get(mcaRelative);
+            if (group == null) {
+                group = new LinkedHashMap<>();
+                byFile.put(mcaRelative, group);
+            }
+            group.put(index, e);
+        }
+
+        SnapshotMirror.Result result = new SnapshotMirror.Result();
+        long nowMillis = System.currentTimeMillis();
+        int nowSeconds = (int) (nowMillis / 1000L);
+        Set<String> handledMca = new HashSet<>();
+        Set<String> handledMcc = new HashSet<>();
+
+        // 先处理 .mca/.mcc（内存组装），再处理松散文件（磁盘镜像），最后清理槽位多余松散文件。
+        for (Map.Entry<String, Map<Integer, StorageOverlay.Entry>> fileEntry : byFile.entrySet()) {
+            String mcaRelative = fileEntry.getKey();
+            Map<Integer, StorageOverlay.Entry> group = fileEntry.getValue();
+            Map<Integer, AnvilDeltaAssembler.NewChunk> changes = new LinkedHashMap<>();
+            Map<String, byte[]> newMcc = new LinkedHashMap<>();
+            for (Map.Entry<Integer, StorageOverlay.Entry> chunkEntry : group.entrySet()) {
+                int index = chunkEntry.getKey();
+                StorageOverlay.Entry je = chunkEntry.getValue();
+                if (je.tag == null) {
+                    changes.put(index, AnvilDeltaAssembler.NewChunk.delete());
+                    continue;
+                }
+                EncodedSector sector = platform.encodeChunkSector(je.tag);
+                if (sector == null || sector.compressed == null) {
+                    return null;
+                }
+                long pos = je.chunkPos;
+                int[] xz = platform.unpackChunkPos(pos);
+                int x = xz[0];
+                int z = xz[1];
+                int total = 5 + sector.compressed.length;
+                int sectors = (total + SnapshotBlockStore.BLOCK_SIZE - 1) / SnapshotBlockStore.BLOCK_SIZE;
+                if (sectors >= SnapshotChunkDecoder.EXTERNAL_CHUNK_THRESHOLD) {
+                    changes.put(index, AnvilDeltaAssembler.NewChunk.external(sector.versionId));
+                    newMcc.put(SnapshotChunkDecoder.mccRelative(mcaRelative, x, z), sector.compressed);
+                } else {
+                    changes.put(index, AnvilDeltaAssembler.NewChunk.update(sector.versionId, sector.compressed));
+                }
+            }
+            byte[] prevBytes = readPreviousMca(store, previous, slotDir, mcaRelative);
+            byte[] assembled = AnvilDeltaAssembler.assemble(prevBytes, changes, nowSeconds);
+            SnapshotBlockStore.Stored stored = store.encodeBytes(assembled);
+            written.put(mcaRelative, assembled.length, stored.hashes);
+            result.manifest.put(mcaRelative, assembled.length, nowMillis);
+            result.files.add(mcaRelative);
+            result.totalBytes += assembled.length;
+            result.copied++;
+            result.copiedBytes += stored.newBytes;
+            result.encoded++;
+            handledMca.add(mcaRelative);
+            for (Map.Entry<String, byte[]> mcc : newMcc.entrySet()) {
+                SnapshotBlockStore.Stored mccStored = store.encodeBytes(mcc.getValue());
+                written.put(mcc.getKey(), mcc.getValue().length, mccStored.hashes);
+                result.manifest.put(mcc.getKey(), mcc.getValue().length, nowMillis);
+                result.files.add(mcc.getKey());
+                result.totalBytes += mcc.getValue().length;
+                result.copied++;
+                result.copiedBytes += mccStored.newBytes;
+                result.encoded++;
+                handledMcc.add(mcc.getKey());
+            }
+        }
+
+        // 未动过的 .mca/.mcc：沿用上次映射，一个字节不读
+        for (String path : previous.paths()) {
+            if (!SnapshotBlockStore.isEncoded(path)) {
+                continue;
+            }
+            if (path.endsWith(".mcc")) {
+                if (handledMcc.contains(path)) {
+                    continue;
+                }
+                // 外溢文件若所属区块本次被改写（转 normal/删除），旧 .mcc 不再沿用
+                if (mccSuperseded(path, byFile)) {
+                    continue;
+                }
+            } else if (handledMca.contains(path)) {
+                continue;
+            }
+            SnapshotBlocks.Entry prev = previous.get(path);
+            SnapshotManifest.Entry rec = previousManifest.get(path);
+            if (prev == null) {
+                continue;
+            }
+            written.put(path, prev.size, prev.hashes);
+            result.manifest.put(path, prev.size, rec == null ? nowMillis : rec.modifiedMillis);
+            result.files.add(path);
+            result.totalBytes += prev.size;
+            result.reused++;
+        }
+
+        // 松散文件：小体量，走磁盘镜像（stat + 按需拷贝），与老路一致
+        List<String> liveAll = SnapshotMirror.listFiles(world);
+        Collections.sort(liveAll);
+        List<String> looseLive = new ArrayList<>();
+        for (String relative : liveAll) {
+            if (!SnapshotBlockStore.isEncoded(relative)) {
+                looseLive.add(relative);
+            }
+        }
+        for (String relative : looseLive) {
+            Path source = world.resolve(relative);
+            long size = Files.size(source);
+            long modified = Files.getLastModifiedTime(source).toMillis();
+            result.manifest.put(relative, size, modified);
+            result.files.add(relative);
+            result.totalBytes += size;
+            Path target = slotDir.resolve(relative);
+            if (previousManifest.matches(relative, size, modified)
+                    && Files.isRegularFile(target) && Files.size(target) == size) {
+                result.skipped++;
+                continue;
+            }
+            Path parent = target.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            copyAtomically(source, target);
+            result.copied++;
+            result.copiedBytes += size;
+        }
+        // 槽位里多出来的松散文件删掉；块映射的 .mca/.mcc 在槽位里没有实体文件，不参与
+        Set<String> wanted = new HashSet<>(looseLive);
+        wanted.addAll(handledMca);
+        wanted.addAll(handledMcc);
+        for (String relative : SnapshotMirror.listFiles(slotDir)) {
+            if (SnapshotBlockStore.isEncoded(relative)) {
+                continue;
+            }
+            if (wanted.contains(relative)) {
+                continue;
+            }
+            if (Files.deleteIfExists(slotDir.resolve(relative))) {
+                result.deleted++;
+            }
+        }
+        pruneEmptyDirectories(slotDir);
+        return result;
+    }
+
+    /** 上一个快照的该文件字节：块映射有就走块存储拼，无（老格式槽位）就读槽位整文件，新文件返回 null。 */
+    private static byte[] readPreviousMca(SnapshotBlockStore store, SnapshotBlocks previous,
+            Path slotDir, String mcaRelative) throws IOException {
+        SnapshotBlocks.Entry prev = previous.get(mcaRelative);
+        if (prev != null) {
+            return store.readAll(prev.hashes, prev.size);
+        }
+        Path file = slotDir.resolve(mcaRelative);
+        if (Files.isRegularFile(file)) {
+            return Files.readAllBytes(file);
+        }
+        return null;
+    }
+
+    /** 该 .mcc 是否因所属区块本次被改写而失效（转 normal/删除，外溢 stub 已不在新文件里）。 */
+    private static boolean mccSuperseded(String mccRelative, Map<String, Map<Integer, StorageOverlay.Entry>> byFile) {
+        String normalized = SnapshotLayout.normalize(mccRelative);
+        int slash = normalized.lastIndexOf('/');
+        String dir = slash < 0 ? "" : normalized.substring(0, slash);
+        String name = slash < 0 ? normalized : normalized.substring(slash + 1);
+        if (!name.startsWith("c.") || !name.endsWith(".mcc")) {
+            return false;
+        }
+        String coords = name.substring(2, name.length() - 4);
+        int dot = coords.indexOf('.');
+        if (dot < 0) {
+            return false;
+        }
+        int x;
+        int z;
+        try {
+            x = Integer.parseInt(coords.substring(0, dot));
+            z = Integer.parseInt(coords.substring(dot + 1));
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        String mcaRelative = SnapshotLayout.normalize(dir + "/" + SnapshotChunkDecoder.regionFileName(x, z));
+        Map<Integer, StorageOverlay.Entry> group = byFile.get(mcaRelative);
+        return group != null && group.containsKey(SnapshotChunkDecoder.chunkIndex(x, z));
+    }
+
+    private static void copyAtomically(Path source, Path target) throws IOException {
+        Path temp = target.resolveSibling(target.getFileName().toString() + SnapshotMirror.TEMP_SUFFIX);
+        Files.copy(source, temp, StandardCopyOption.REPLACE_EXISTING);
+        try {
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException atomicUnsupported) {
+            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void pruneEmptyDirectories(Path root) throws IOException {
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<Path>() {
+            @Override
+            public java.nio.file.FileVisitResult postVisitDirectory(Path dir, IOException exc) {
+                if (dir.equals(root)) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+                if (SnapshotLayout.isExcluded(SnapshotLayout.relativize(root, dir))) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+                try (java.nio.file.DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+                    if (!stream.iterator().hasNext()) {
+                        Files.deleteIfExists(dir);
+                    }
+                } catch (IOException ignored) {
+                    // 非空或被占用：留着即可
+                }
+                return java.nio.file.FileVisitResult.CONTINUE;
+            }
+        });
     }
 
     /**

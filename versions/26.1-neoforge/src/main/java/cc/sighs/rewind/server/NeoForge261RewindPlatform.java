@@ -1,10 +1,16 @@
 package cc.sighs.rewind.server;
 
 import java.nio.file.Path;
+import cc.sighs.rewind.common.spi.EncodedSector;
 import cc.sighs.rewind.common.spi.FlushOutcome;
 import cc.sighs.rewind.common.spi.RewindPlatform;
 import cc.sighs.rewind.common.spi.RollbackOutcome;
+import cc.sighs.rewind.common.spi.StorageKind;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.fml.loading.FMLLoader;
 
@@ -93,5 +99,83 @@ public final class NeoForge261RewindPlatform implements RewindPlatform {
 
     private static MinecraftServer server(Object server) {
         return (MinecraftServer) server;
+    }
+
+    /**
+     * 写账本 NBT → 扇区负载：DEFLATE 压缩（解码器按头版本分派，重压成 DEFLATE 依然合法）。
+     *
+     * <p>与原版 {@code RegionFileStorage.write} 的压缩路径同构（{@code NbtIo.write} 进
+     * 版本包装流），只是不经过文件。要求入参是纯数据（调用方已 {@code copy()} 过）。
+     */
+    @Override
+    public EncodedSector encodeChunkSector(Object tag) {
+        if (!(tag instanceof CompoundTag)) {
+            return null;
+        }
+        try {
+            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream(8192);
+            try (java.io.DataOutputStream out =
+                    new java.io.DataOutputStream(RegionFileVersion.VERSION_DEFLATE.wrap(raw))) {
+                NbtIo.write((CompoundTag) tag, out);
+            }
+            return new EncodedSector(RegionFileVersion.VERSION_DEFLATE.getId(), raw.toByteArray());
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /** 扇区负载字节 → 写账本句柄（回滚灌装用）。 */
+    @Override
+    public Object decodeChunkSector(byte[] uncompressed) {
+        if (uncompressed == null) {
+            return null;
+        }
+        try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(uncompressed))) {
+            return NbtIo.read(in);
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * （种类，维度）→ region 目录相对路径。26.1 的维度存储目录由
+     * {@code DimensionType.getStorageFolder} 决定：{@code dimensions/<命名空间>/<路径>/}，
+     * 下面再挂 {@code region/}、{@code entities/}、{@code poi/}。
+     * 维度 id 不是 {@code <命名空间>:<路径>} 形状就返回 null
+     * （增量建点对这些条目回退磁盘扫描，绝不硬猜）。
+     */
+    @Override
+    public String chunkDirRelative(StorageKind kind, String dimensionId) {
+        String leaf;
+        switch (kind) {
+            case CHUNK:
+                leaf = "region";
+                break;
+            case ENTITY:
+                leaf = "entities";
+                break;
+            case POI:
+                leaf = "poi";
+                break;
+            default:
+                return null;
+        }
+        int colon = dimensionId.indexOf(':');
+        if (colon <= 0 || colon == dimensionId.length() - 1) {
+            return null;
+        }
+        String namespace = dimensionId.substring(0, colon);
+        String path = dimensionId.substring(colon + 1);
+        return "dimensions/" + namespace + "/" + path + "/" + leaf;
+    }
+
+    /**
+     * 26.1 打包布局以 {@code ChunkPos.unpack} 为准（与旧 `toLong` 同为 x 低 / z 高，
+     * 但构造器已删，必须走官方逆运算，硬猜位移在未来版本会错位）。
+     */
+    @Override
+    public int[] unpackChunkPos(long packed) {
+        ChunkPos pos = ChunkPos.unpack(packed);
+        return new int[]{pos.x(), pos.z()};
     }
 }

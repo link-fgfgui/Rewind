@@ -4,6 +4,7 @@ import cc.sighs.rewind.Rewind;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.players.PlayerList;
+import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.RegionFileStorage;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
@@ -11,6 +12,7 @@ import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.storage.DimensionDataStorage;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -50,6 +52,9 @@ public final class RollbackDiscardMixins {
     /** 区块：saveAllChunks(true/false) 两种路径都会经过这里（ServerChunkCache.close 的 save(true) 也是）。 */
     @Mixin(ChunkMap.class)
     public abstract static class ChunkMapDiscard {
+        @Shadow
+        private PoiManager poiManager;
+
         @Inject(method = "saveAllChunks(Z)V", at = @At("HEAD"), cancellable = true)
         private void rewind$skipChunkSaveDuringRollback(boolean flush, CallbackInfo ci) {
             if (Rewind.isDiscarding()) {
@@ -74,10 +79,21 @@ public final class RollbackDiscardMixins {
          * 单个区块的落盘（{@code scheduleUnload} / {@code saveChunkIfNeeded} / {@code saveAllChunks} 都汇到这里）。
          * 原地回滚要主动卸载区块，卸载路径本身会调 {@code save}——这里整段跳过，省掉
          * {@code ChunkSerializer.write} 的序列化开销（写下去的也马上会被快照覆盖）。
+         *
+         * <p>双路细节：原版 {@code save} 先无条件 {@code poiManager.flush(pos)} 再判
+         * {@code isUnsaved}——头部早退会漏掉 POI 脏标记，下一 tick 就把未来的 POI
+         * 照写一遍盖掉刚还原的文件。所以早退前先 {@code flush} 清脏：它的异步写会被
+         * 底层的 {@code RegionFileStorage.write} 丢弃窗口挡掉（只清脏、不污染盘面）。
+         * （1.20.1 的 {@code flush} 在父类 {@code SectionStorage} 上，语义与 1.21.1 一致。）
          */
         @Inject(method = "save(Lnet/minecraft/world/level/chunk/ChunkAccess;)Z", at = @At("HEAD"), cancellable = true)
         private void rewind$skipSingleChunkSaveDuringRollback(ChunkAccess chunk, CallbackInfoReturnable<Boolean> cir) {
             if (Rewind.isDiscarding()) {
+                try {
+                    this.poiManager.flush(chunk.getPos());
+                } catch (Throwable ignored) {
+                    // POI 清脏失败不影响丢弃本身
+                }
                 cir.setReturnValue(false);
             }
         }

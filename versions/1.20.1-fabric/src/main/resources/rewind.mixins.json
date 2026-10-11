@@ -26,7 +26,11 @@
     "RollbackAccessMixins$DimensionDataStorageAccess",
     "InPlaceGuardMixins$ChunkMapRecreationGuard",
     "AutoCheckpointMixins$MinecraftServerAutosave",
-    "AuiFabricAnnotationScanMixins"
+    "AuiFabricAnnotationScanMixins",
+    "StorageJournalMixins$IOWorkerJournal",
+    "DataJournalMixins$SavedDataJournal",
+    "DataJournalMixins$DimensionDataStorageCover",
+    "DataJournalMixins$PlayerDataJournal"
   ],
   "client": [
     "ClientFrameMixins",

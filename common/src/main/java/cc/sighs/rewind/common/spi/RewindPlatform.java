@@ -58,4 +58,49 @@ public interface RewindPlatform {
      * <p>用于可选模组适配，见 {@code cc.sighs.rewind.common.compat.SophisticatedCoreCompat}。
      */
     ClassLoader modClassLoader(String modId);
+
+    /**
+     * 把写账本里的不透明 NBT 句柄压缩成扇区负载（增量建点用）。
+     *
+     * <p>默认返回 null（该平台还没接增量建点，建点回退到全量磁盘扫描）。
+     * 接入的版本用自己的 {@code NbtIo.write} + {@code RegionFileVersion} 实现，
+     * 压缩算法固定用 DEFLATE（解码器按头版本分派，重压成别的版本依然合法）。
+     *
+     * @param tag 写账本里存的那个句柄（版本侧的 {@code CompoundTag}）
+     */
+    default EncodedSector encodeChunkSector(Object tag) {
+        return null;
+    }
+
+    /**
+     * 把解压后的 NBT 负载字节解成写账本能存的不透明句柄（回滚灌装用）。
+     *
+     * <p>默认返回 null（该平台还没接内存直解，回滚回退到读活文件）。
+     * 接入的版本用自己的 {@code NbtIo.read} 实现。
+     *
+     * @param uncompressed 解码器解出来的未压缩 NBT 字节
+     */
+    default Object decodeChunkSector(byte[] uncompressed) {
+        return null;
+    }
+
+    /**
+     * 增量建点时“(种类, 维度) → region 目录相对路径”的映射（如
+     * {@code region}、{@code DIM-1/region}、{@code entities}……，相对世界根，
+     * {@code /} 分隔）。默认返回 null（未知布局，涉及该条目的文件回退到磁盘扫描；
+     * 1.20.1 模组自定义维度布局即走此分支，绝不硬猜）。
+     */
+    default String chunkDirRelative(StorageKind kind, String dimensionId) {
+        return null;
+    }
+
+    /**
+     * 把账本里的打包坐标拆成 {@code {x, z}}（增量建点分组与 region 文件名用）。
+     *
+     * <p>默认按原版 `ChunkPos.toLong()` 布局（x 在低 32 位，z 在高 32 位）；
+     * 打包方式不同的版本（如 26.1 的 `pack()`）覆盖它，一律以该版本实际 API 为准。
+     */
+    default int[] unpackChunkPos(long packed) {
+        return new int[]{(int) packed, (int) (packed >> 32)};
+    }
 }

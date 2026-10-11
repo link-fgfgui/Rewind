@@ -26,7 +26,12 @@
     "RollbackAccessMixins$EntitySectionManagerAccess",
     "RollbackAccessMixins$SavedDataStorageAccess",
     "InPlaceGuardMixins$ChunkMapRecreationGuard",
-    "AutoCheckpointMixins$MinecraftServerAutosave"
+    "AutoCheckpointMixins$MinecraftServerAutosave",
+    "StorageJournalMixins$IOWorkerJournal",
+    "DataJournalMixins$SavedDataJournal",
+    "DataJournalMixins$SavedDataStorageCover",
+    "DataJournalMixins$PlayerDataJournal",
+    "DataJournalMixins$LevelDataJournal"
   ],
   "client": [
     "KeyBindsListMixins$OnlyRewindKeys",

@@ -1,9 +1,11 @@
 package cc.sighs;
 
+import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.spi.RewindPlatforms;
 import cc.sighs.rewind.server.FabricRewindPlatform;
 import cc.sighs.rewind.server.RewindServerConfig;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 
 /**
  * Fabric 1.20.1 的入口。
@@ -21,5 +23,7 @@ public final class RewindFabric implements ModInitializer {
         RewindPlatforms.install(new FabricRewindPlatform());
         // 服务端行为的配置两边都要有，所以放在主入口而不是客户端入口里
         RewindServerConfig.register();
+        // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> RewindState.onWorldUnloaded());
     }
 }

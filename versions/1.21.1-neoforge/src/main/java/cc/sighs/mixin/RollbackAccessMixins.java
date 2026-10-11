@@ -17,7 +17,9 @@ import net.minecraft.server.level.DistanceManager;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.entity.raid.Raids;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.ChunkStorage;
 import net.minecraft.world.level.chunk.storage.EntityStorage;
 import net.minecraft.world.level.chunk.storage.IOWorker;
@@ -74,6 +76,18 @@ public final class RollbackAccessMixins {
         /** 排空卸载队列：把 toDrop 里的 holder 真的丢掉（含原版的卸载收尾）。 */
         @Invoker("processUnloads")
         void rewind$processUnloads(BooleanSupplier supplier);
+
+        /**
+         * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：强制标脏收尾时，
+         * 对“回滚影响过、但此时不在可见集合或已被卸载”的离线区块补齐落盘，
+         * 不依赖 {@code saveAllChunks} 的可见性/冷却过滤。
+         */
+        @Invoker("save")
+        boolean rewind$saveDirect(ChunkAccess chunk);
+
+        /** 兴趣点管理器：丢弃窗口内先 {@code flush} 清脏再取消，避免 POI 脏标记漏网。 */
+        @Accessor("poiManager")
+        PoiManager rewind$poiManager();
 
         @Accessor("toDrop")
         LongSet rewind$toDrop();
@@ -200,6 +214,14 @@ public final class RollbackAccessMixins {
     public interface DimensionDataStorageAccess {
         @Accessor("cache")
         Map<String, SavedData> rewind$cache();
+
+        /** 该维度的数据目录（读拦截按绝对路径拼覆盖键，写监听按保存文件拼同一把键）。 */
+        @Accessor("dataFolder")
+        java.io.File rewind$dataFolder();
+
+        /** 反序列化快照 NBT 要用它（读拦截在覆盖命中时直接构造实例，不走磁盘）。 */
+        @Accessor("registries")
+        net.minecraft.core.HolderLookup.Provider rewind$registries();
     }
 
     /**

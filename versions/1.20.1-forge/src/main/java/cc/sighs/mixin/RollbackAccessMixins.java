@@ -18,7 +18,9 @@ import net.minecraft.server.level.DistanceManager;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.entity.raid.Raids;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.ChunkStorage;
 import net.minecraft.world.level.chunk.storage.EntityStorage;
 import net.minecraft.world.level.chunk.storage.IOWorker;
@@ -93,6 +95,18 @@ public final class RollbackAccessMixins {
          */
         @Invoker("processUnloads")
         void rewind$processUnloads(BooleanSupplier supplier);
+
+        /**
+         * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：强制标脏收尾时，
+         * 对“回滚影响过、但此时不在可见集合或已被卸载”的离线区块补齐落盘，
+         * 不依赖 {@code saveAllChunks} 的可见性/冷却过滤。
+         */
+        @Invoker("save")
+        boolean rewind$saveDirect(ChunkAccess chunk);
+
+        /** 兴趣点管理器：丢弃窗口内先 {@code flush} 清脏再取消，避免 POI 脏标记漏网。 */
+        @Accessor("poiManager")
+        PoiManager rewind$poiManager();
 
         @Accessor("toDrop")
         LongSet rewind$toDrop();
@@ -219,10 +233,21 @@ public final class RollbackAccessMixins {
         LongSet rewind$chunksToUnload();
     }
 
-    /** 存档数据缓存：回滚后清掉对应条目，下一次 {@code computeIfAbsent} 会重新读盘。 */
+    /**
+     * 存档数据缓存：回滚后清掉对应条目，下一次 {@code computeIfAbsent} 会重新读盘。
+     *
+     * <p>1.20.1 的 {@code DimensionDataStorage} 只有 {@code cache / fixerUpper / dataFolder}
+     * 三个字段，没有 {@code registries}（反序列化只用传进 {@code get} 的那个
+     * {@code Function<CompoundTag, T>}，不需要 Provider）。读拦截只挂
+     * {@code readTagFromDisk} 短路，不做反序列化。
+     */
     @Mixin(DimensionDataStorage.class)
     public interface DimensionDataStorageAccess {
         @Accessor("cache")
         Map<String, SavedData> rewind$cache();
+
+        /** 该维度的数据目录（读写两端按绝对路径拼出同一把覆盖键）。 */
+        @Accessor("dataFolder")
+        java.io.File rewind$dataFolder();
     }
 }
