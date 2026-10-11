@@ -152,57 +152,6 @@ public final class StorageJournalMixins {
         }
 
         /**
-         * 读时登记冷区块基线（Copy-on-First-Write 的前半段）。
-         *
-         * <p>武装/丢弃窗口内不登记（回滚重载读到的是快照，不是基线）。平时把返回 future
-         * 包一层：完成时若该坐标自建点后还没写过，就把读到的数据拷一份登记为基线；
-         * 若从未被写过，回滚时它不在变更集内、直接放行走盘，完全不占快照资源。
-         * 包裝失败（原版返回 null 之类）就当没拦住，原样返回。
-         */
-        @Inject(
-                method = "loadAsync(Lnet/minecraft/world/level/ChunkPos;)Ljava/util/concurrent/CompletableFuture;",
-                at = @At("RETURN"),
-                cancellable = true)
-        private void rewind$noteColdBaseline(
-                ChunkPos chunkPos, CallbackInfoReturnable<CompletableFuture<Optional<CompoundTag>>> cir) {
-            try {
-                if (RewindState.isDiscarding() || RewindState.isStorageCoverArmed()) {
-                    return;
-                }
-                CompletableFuture<Optional<CompoundTag>> original = cir.getReturnValue();
-                if (original == null) {
-                    return;
-                }
-                RegionStorageInfo info = this.storageInfo();
-                StorageKind kind = kindOf(info.type());
-                if (kind == null) {
-                    return;
-                }
-                String dimension = info.dimension().identifier().toString();
-                long pos = chunkPos.pack();
-                if (!RewindState.needsColdBaseline(kind, dimension, pos)) {
-                    return;
-                }
-                final StorageKind finalKind = kind;
-                final String finalDimension = dimension;
-                cir.setReturnValue(original.thenApply(optional -> {
-                    try {
-                        if (optional != null && optional.isPresent() && optional.get() != null
-                                && RewindState.needsColdBaseline(finalKind, finalDimension, pos)) {
-                            RewindState.noteColdBaseline(finalKind, finalDimension, pos,
-                                    optional.get().copy());
-                        }
-                    } catch (Throwable ignored) {
-                        // 基线登记绝不能污染读盘结果
-                    }
-                    return optional;
-                }));
-            } catch (Throwable ignored) {
-                // 包装失败就当没拦住，原 future 照走
-            }
-        }
-
-        /**
          * 扫描入口：blending / `isOldChunkAround` 走这里，不过它就看到不一致的数据。
          *
          * <p>有覆盖时把账本那份喂给 visitor（与原版喂 `pendingWrites` 那份同构），

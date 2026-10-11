@@ -2,7 +2,6 @@ package cc.sighs.rewind.server;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -47,8 +46,6 @@ import cc.sighs.rewind.snapshot.ZPackCheckpoint;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtAccounter;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.protocol.game.ClientboundSetCarriedItemPacket;
@@ -133,11 +130,9 @@ public final class InPlaceRollback {
         public int affectedChunks;
         public int unloadedChunks;
         public int reloadedChunks;
-        /** 视野外、交给原版流水线异步读回来的区块数（零磁盘架构下恒为 0：全部同步读回）。 */
+        /** 视野外、交给原版流水线异步读回来的区块数（同步读回架构下恒为 0：全部同步读回）。 */
         public int deferredChunks;
         public int stuckChunks;
-        /** 对 `/saves` 的读/写次数（零磁盘架构的验收口：恒为 0）。 */
-        public int closedRegionFiles;
         public String mirror = "";
         public int mirrorCopied;
         public int mirrorSkipped;
@@ -259,7 +254,7 @@ public final class InPlaceRollback {
             result.cacheMs = millisSince(subNanos);
             result.unloadMs = millisSince(stepNanos);
 
-            // 零磁盘回滚：不关存储句柄（Windows 文件锁问题自然消失），不回拷文件。
+            // 零文件覆写回滚：不关存储句柄（Windows 文件锁问题自然消失），不回拷文件。
             // 覆盖层在这里灌好并武装，后面重建与重载读到的就是检查点数据；
             // 未被备份/未改动的区域不在覆盖层内，自然穿透走盘，二者零冲突。
             stepNanos = System.nanoTime();
@@ -284,7 +279,7 @@ public final class InPlaceRollback {
             // 也不能更早：player.load() 会走 Entity.setPosRaw，NeoForge 在那里会 level.getChunk() 请求
             // 区块，holder 不在就会直接 NPE。
             stepNanos = System.nanoTime();
-            restoreWorldAndPlayers(server, slotDir, result);
+            restoreWorldAndPlayers(server, result);
             result.stateMs = millisSince(stepNanos);
 
             stepNanos = System.nanoTime();
@@ -292,22 +287,24 @@ public final class InPlaceRollback {
             result.reloadMs += millisSince(stepNanos);
 
             try {
-                restoreSavedData(server, slotDir, dataFiles);
+                restoreSavedData(server, dataFiles);
             } catch (Throwable t) {
                 Rewind.LOGGER.error("Rewind: failed to reload saved data in place", t);
             }
+
+            // 命中数必须在撤装前取：撤装连账本一起清，等到 finally 再取就恒为 0（验收指标失效）。
+            // 先撤装再开写：撤装卸下覆盖层，之后的第 13 步直写走原版管道，写监听把回滚后的状态记成新基线。
+            result.coverHits = RewindState.storageJournal().serveHits() + RewindState.dataCover().serveHits();
+            RewindState.disarmStorageCover();
+            Rewind.LOGGER.info("Rewind: storage cover served {} reads ({} chunks covered)",
+                    result.coverHits, coveredChunks);
 
             stepNanos = System.nanoTime();
             forceDirty(server, targets);
             result.forceDirtyMs = millisSince(stepNanos);
         } finally {
-            // 先撤装再开写：撤装连账本一起清（回滚完成=新基线，之后重记）。
-            // 命中数是稀疏拦截的验收口——大于 0 说明重载真的走了覆盖层。
-            long coverHits = RewindState.storageJournal().serveHits() + RewindState.dataCover().serveHits();
-            result.coverHits = coverHits;
+            // 异常路径兜底（正常路径上面已撤装，幂等）：卸下覆盖层。
             RewindState.disarmStorageCover();
-            Rewind.LOGGER.info("Rewind: storage cover served {} reads ({} chunks covered)",
-                    coverHits, coveredChunks);
             // 回滚窗口一直开到整段结束：这期间任何落盘都是要被丢弃的（实体卸载的收尾写入尤其危险）
             Rewind.clearUnloadGuards();
             Rewind.endDiscard();
@@ -479,7 +476,7 @@ public final class InPlaceRollback {
             covered += populateCoverForLevel(slotDir, blocks, store, zpackCover, entry.getKey(), entry.getValue(),
                     result);
         }
-        covered += populateDataCover(server, worldRoot, slotDir, zpackCover, dataFiles);
+        covered += populateDataCover(server, worldRoot, zpackCover, targets, dataFiles);
         result.coverPopulated = covered;
         result.mirror = "cover=" + covered;
         result.mirrorCopied = covered;
@@ -523,12 +520,6 @@ public final class InPlaceRollback {
     private static boolean populateCoverForChunk(Path slotDir, SnapshotBlocks blocks,
             SnapshotBlockStore store, Map<String, byte[]> zpackCover, NeoForgeRewindPlatform platform,
             String dir, StorageKind kind, String dimensionId, ChunkPos pos, Result result) {
-        // 写前冻结优先：冷区块在建点后第一次被改写前留下的基底，本身就是快照数据
-        Object frozen = RewindState.frozenBase(kind, dimensionId, pos.toLong());
-        if (frozen instanceof CompoundTag) {
-            RewindState.storageJournal().onWritten(kind, dimensionId, pos.toLong(), ((CompoundTag) frozen).copy());
-            return true;
-        }
         // zpack 快路：命中即喂账本；未命中/解码失败一律回退旧路（链洞≠删除）。
         if (zpackCover != null) {
             String key = ZPack.keyOf(ZPackCheckpoint.kindToType(kind), dimensionId, pos.toLong());
@@ -595,24 +586,58 @@ public final class InPlaceRollback {
     }
 
     /**
-     * 非区块 NBT 灌装：把槽位的 {@code .dat} 读进数据覆盖层（快照目录，允许）。
+     * 非区块 NBT 灌装：把存档点的 {@code .dat} 从 zpack 统一解码装配进数据覆盖层（决策 2）。
      *
-     * <p>数据源二选一：优先 zpack 快路（按世界根相对路径匹配 {@code TYPE_DATA_FILE}，
-     * 载荷为未压缩 NBT 字节，命中即解码灌装）；未命中或解码失败回退读槽位磁盘文件——
-     * “zpack 里没有”永不等价于删除（链上可能有洞/老槽位无包）。
+     * <p>数据源只有一个：{@code zpackCover}（链式差分解出的全量表，{@code TYPE_DATA_FILE}
+     * 条目为未压缩 NBT 字节）。槽位松散 {@code .dat} 一律不再读取——回滚期间全部非区块
+     * 状态由内存 {@link RewindState#dataCover()} 提供。该槽位无包（老槽位 / 链损坏）时
+     * 不灌装任何条目也不猜删除（宁慢勿串）。
      *
-     * <p>存档数据按“活文件绝对路径”拼键（与读写两端的键一致）：每个维度的
-     * {@code DimensionDataStorage} 数据目录在槽位里找同名 {@code .dat}，
-     * 有就读入覆盖，没有就记删除标记（回滚后懒加载不再复活未来文件）。
-     * 玩家数据只灌在线玩家的（离线玩家走登录时读盘，届时覆盖已撤——与区块冷加载不同，
-     * 玩家登录必经服务端线程，可单独对账；缺席同样记删除标记）。
+     * <p>候选 id 取「zpack 里该数据目录前缀下的条目 ∪ 活目录枚举」：活目录枚举只做 readdir
+     * （不读内容），用于识别「建点之后才出现的文件」并记删除标记，回滚后懒加载不再复活未来文件；
+     * 链里没有该 key 而活文件存在即按此处理。玩家数据只灌在线玩家的（离线玩家走登录时读盘，
+     * 届时覆盖已撤；缺席同样记删除标记）。{@code level.dat} 也入覆盖（供 {@link #restoreWorldData}
+     * 纯内存读取世界时间/天气/出生点）。
      *
      * @return 灌装计数；dataFiles 收集本次覆盖到的存档数据文件相对路径（世界根基准，给日志用）
      */
-    private static int populateDataCover(MinecraftServer server, Path worldRoot, Path slotDir,
-            Map<String, byte[]> zpackCover, List<String> dataFiles) {
+    private static int populateDataCover(MinecraftServer server, Path worldRoot, Map<String, byte[]> zpackCover,
+            List<Target> targets, List<String> dataFiles) {
         int covered = 0;
-        NeoForgeRewindPlatform platform = zpackCover == null ? null : new NeoForgeRewindPlatform();
+        if (server == null) {
+            return 0;
+        }
+        if (zpackCover == null) {
+            // 老槽位 / 包损坏：没有差分数据源，不灌装也不猜删除（决策 2：内容只认 zpack）
+            Rewind.LOGGER.warn("Rewind: slot has no readable zpack, non-chunk data cover skipped");
+            return 0;
+        }
+        NeoForgeRewindPlatform platform = new NeoForgeRewindPlatform();
+        // zpack 的 DATA_FILE 条目按相对路径分组：相对目录 → 文件名（去 .dat）
+        Map<String, Set<String>> idsByDir = new HashMap<>();
+        for (String zpackKey : zpackCover.keySet()) {
+            ZPack.ParsedKey parsed;
+            try {
+                parsed = ZPack.parseKey(zpackKey);
+            } catch (Throwable ignored) {
+                continue;
+            }
+            if (parsed.targetType != ZPack.TYPE_DATA_FILE) {
+                continue;
+            }
+            String relative = SnapshotLayout.normalize(parsed.id);
+            int slash = relative.lastIndexOf('/');
+            if (slash <= 0) {
+                continue; // level.dat / level.dat_old 另行处理
+            }
+            String dir = relative.substring(0, slash);
+            String name = relative.substring(slash + 1);
+            if (!name.endsWith(".dat")) {
+                continue;
+            }
+            idsByDir.computeIfAbsent(dir, k -> new HashSet<>())
+                    .add(name.substring(0, name.length() - 4));
+        }
         Set<String> seenDataKeys = new HashSet<>();
         for (ServerLevel level : server.getAllLevels()) {
             DimensionDataStorageAccess access =
@@ -622,27 +647,16 @@ public final class InPlaceRollback {
                 continue;
             }
             Path liveDir = dataFolder.toPath();
-            Path slotDataDir;
+            String dirRelative;
             try {
-                slotDataDir = slotDir.resolve(SnapshotLayout.relativize(worldRoot, liveDir));
+                dirRelative = SnapshotLayout.normalize(SnapshotLayout.relativize(worldRoot, liveDir));
             } catch (Throwable t) {
                 continue;
             }
-            // 槽位里有的 .dat：读入覆盖；活文件有、槽位没有的：同样要处理（删除标记），
-            // 否则回滚后懒加载读到未来文件。活目录的枚举只做 readdir（不读内容），代价可忽略。
             Set<String> ids = new HashSet<>();
-            if (Files.isDirectory(slotDataDir)) {
-                try (java.nio.file.DirectoryStream<Path> stream =
-                        Files.newDirectoryStream(slotDataDir, "*.dat")) {
-                    for (Path dat : stream) {
-                        String name = dat.getFileName().toString();
-                        if (name.endsWith(".dat")) {
-                            ids.add(name.substring(0, name.length() - 4));
-                        }
-                    }
-                } catch (Throwable ignored) {
-                    // 枚举失败就当没有
-                }
+            Set<String> fromPack = idsByDir.get(dirRelative);
+            if (fromPack != null) {
+                ids.addAll(fromPack);
             }
             if (Files.isDirectory(liveDir)) {
                 try (java.nio.file.DirectoryStream<Path> stream =
@@ -658,107 +672,91 @@ public final class InPlaceRollback {
                 }
             }
             for (String id : ids) {
-                Path slotFile = slotDataDir.resolve(id + ".dat");
                 File liveFile = new File(dataFolder, id + ".dat");
                 String key = cc.sighs.mixin.DataJournalMixins.savedataKey(liveFile);
                 if (!seenDataKeys.add(key)) {
                     continue;
                 }
-                String relative = null;
+                String relative;
                 try {
                     relative = SnapshotLayout.relativize(worldRoot, liveFile.toPath());
-                } catch (Throwable ignored) {
-                    // 相对化失败只影响 zpack 快路与日志，不影响槽位盘读
+                } catch (Throwable t) {
+                    continue;
                 }
-                // zpack 快路：命中即灌装；未命中/解码失败一律回退槽位盘读（链洞≠删除）
-                if (zpackCover != null && relative != null) {
-                    byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, relative, 0L));
-                    if (raw != null) {
-                        try {
-                            if (raw.length == 0) {
-                                RewindState.dataCover().onWritten(key, null);
-                                covered++;
-                                continue;
-                            }
-                            Object tag = platform.decodeChunkSector(raw);
-                            if (tag instanceof CompoundTag) {
-                                RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
-                                covered++;
-                                dataFiles.add(relative);
-                                continue;
-                            }
-                            Rewind.LOGGER.warn("Rewind: zpack data entry {} undecodable, falling back to slot file",
-                                    relative);
-                        } catch (Throwable t) {
-                            Rewind.LOGGER.warn("Rewind: zpack data entry {} failed, falling back to slot file",
-                                    relative, t);
-                        }
-                    }
-                }
-                if (!Files.isRegularFile(slotFile)) {
+                byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, relative, 0L));
+                if (raw == null) {
+                    // 活文件有、链里没有：建点之后才出现的文件 → 删除标记（回滚后不复活未来文件）
                     RewindState.dataCover().onWritten(key, null);
+                    covered++;
+                    continue;
+                }
+                if (raw.length == 0) {
+                    RewindState.dataCover().onWritten(key, null);
+                    covered++;
                     continue;
                 }
                 try {
-                    CompoundTag full = NbtIo.readCompressed(slotFile, NbtAccounter.unlimitedHeap());
-                    RewindState.dataCover().onWritten(key, full.copy());
-                    covered++;
-                    if (relative != null) {
+                    Object tag = platform.decodeChunkSector(raw);
+                    if (tag instanceof CompoundTag) {
+                        RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
+                        covered++;
                         dataFiles.add(relative);
+                    } else {
+                        Rewind.LOGGER.warn("Rewind: zpack data entry {} undecodable, cover skipped", relative);
                     }
                 } catch (Throwable t) {
-                    Rewind.LOGGER.warn("Rewind: cannot read checkpoint data file {}, skipping cover for it",
-                            slotFile, t);
+                    Rewind.LOGGER.warn("Rewind: zpack data entry {} failed, cover skipped", relative, t);
                 }
             }
         }
-        // 玩家数据：在线的按槽位读入，缺席记删除标记
-        Path livePlayerDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            String key = cc.sighs.mixin.DataJournalMixins.playerKey(player.getStringUUID());
-            Path slotFile = slotDir.resolve("playerdata").resolve(player.getStringUUID() + ".dat");
-            String liveRelative = SnapshotLayout.relativize(worldRoot,
-                    livePlayerDir.resolve(player.getStringUUID() + ".dat"));
-            // zpack 快路（世界根相对路径键）；.dat_old 不在 zpack 内，未命中照旧回退盘读
-            if (zpackCover != null) {
-                byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, liveRelative, 0L));
-                if (raw != null) {
-                    try {
-                        if (raw.length == 0) {
-                            RewindState.dataCover().onWritten(key, null);
-                            covered++;
-                            continue;
-                        }
-                        Object tag = platform.decodeChunkSector(raw);
-                        if (tag instanceof CompoundTag) {
-                            RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
-                            covered++;
-                            continue;
-                        }
-                        Rewind.LOGGER.warn("Rewind: zpack player entry {} undecodable, falling back to slot file",
-                                liveRelative);
-                    } catch (Throwable t) {
-                        Rewind.LOGGER.warn("Rewind: zpack player entry {} failed, falling back to slot file",
-                                liveRelative, t);
-                    }
+        // level.dat：世界时间 / 天气 / 出生点的纯内存还原源
+        byte[] levelRaw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, "level.dat", 0L));
+        if (levelRaw != null && levelRaw.length > 0) {
+            try {
+                Object tag = platform.decodeChunkSector(levelRaw);
+                if (tag instanceof CompoundTag) {
+                    String key = cc.sighs.mixin.DataJournalMixins.savedataKey(
+                            worldRoot.resolve("level.dat").toFile());
+                    RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
+                    covered++;
                 }
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: zpack level.dat entry failed, cover skipped", t);
             }
-            if (!Files.isRegularFile(slotFile)) {
-                Path oldFile = slotDir.resolve("playerdata").resolve(player.getStringUUID() + ".dat_old");
-                if (Files.isRegularFile(oldFile)) {
-                    slotFile = oldFile;
-                } else {
-                    RewindState.dataCover().onWritten(key, null);
-                    continue;
-                }
+        }
+        // 玩家数据：只灌在线玩家的；链里缺席记删除标记（离线玩家走登录时读盘，覆盖已撤）
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            String uuid = player.getStringUUID();
+            String key = cc.sighs.mixin.DataJournalMixins.playerKey(uuid);
+            String liveRelative;
+            try {
+                liveRelative = SnapshotLayout.relativize(
+                        worldRoot, server.getWorldPath(LevelResource.PLAYER_DATA_DIR).resolve(uuid + ".dat"));
+            } catch (Throwable t) {
+                continue;
+            }
+            byte[] raw = zpackCover.get(ZPack.keyOf(ZPack.TYPE_DATA_FILE, liveRelative, 0L));
+            if (raw == null) {
+                RewindState.dataCover().onWritten(key, null);
+                covered++;
+                continue;
+            }
+            if (raw.length == 0) {
+                RewindState.dataCover().onWritten(key, null);
+                covered++;
+                continue;
             }
             try {
-                CompoundTag tag = NbtIo.readCompressed(slotFile, NbtAccounter.unlimitedHeap());
-                RewindState.dataCover().onWritten(key, tag.copy());
-                covered++;
+                Object tag = platform.decodeChunkSector(raw);
+                if (tag instanceof CompoundTag) {
+                    RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
+                    covered++;
+                    dataFiles.add(liveRelative);
+                } else {
+                    Rewind.LOGGER.warn("Rewind: zpack player entry {} undecodable, cover skipped", liveRelative);
+                }
             } catch (Throwable t) {
-                Rewind.LOGGER.warn("Rewind: cannot read checkpoint player data {}, skipping cover for it",
-                        slotFile, t);
+                Rewind.LOGGER.warn("Rewind: zpack player entry {} failed, cover skipped", liveRelative, t);
             }
         }
         return covered;
@@ -969,7 +967,7 @@ public final class InPlaceRollback {
         }
     }
 
-    // ------------------------------------------------------------------ 3. 排空写入（零磁盘：句柄不关、文件不拷）
+    // ------------------------------------------------------------------ 3. 排空写入（零文件覆写：句柄不关、文件不拷）
 
     private static IOWorker poiWorker(PoiManager poi) {
         SimpleRegionStorage storage = sectionStorageAccess(poi).rewind$simpleRegionStorage();
@@ -1038,7 +1036,7 @@ public final class InPlaceRollback {
     /**
      * 把重建好的区块读回来：全部同步读（这也是原版把新数据推给客户端的触发点）。
      *
-     * <p>零磁盘架构下不设“视野外延迟”：覆盖层在撤装时清空，延迟加载的区块会错过覆盖、
+     * <p>同步读回架构下不设“视野外延迟”：覆盖层在撤装时清空，延迟加载的区块会错过覆盖、
      * 穿透读到盘上的未来数据。受影响集与“建点后改了多少”成正比，同步读完才关窗口。
      */
     private static void loadChunks(MinecraftServer server, List<Target> targets, Result result) {
@@ -1095,9 +1093,13 @@ public final class InPlaceRollback {
      * <p>原版只有 {@code isUnsaved()} 的区块才会落盘，且 {@code saveAllChunks} 只遍历
      * 可见集合并检查 {@code wasAccessibleSinceLastSave}（退出世界时 {@code flush=true} 也一样）。
      * 所以回滚重载完成后，对所有目标显式 {@code setUnsaved(true)} 并刷新可访问性；
-     * 存档数据全部 {@code setDirty(true)}。再在丢弃窗口之外显式直写一遍目标区块——
-     * 即使之后 filtered 漏写，盘上也已经是快照内容；直写走原版标准管道，
-     * 写监听自然捕获（窗口已关，记的是快照态基线），状态机自动对齐。
+     * 存档数据全部 {@code setDirty(true)}。
+     *
+     * <p>再在丢弃窗口之外显式直写一遍目标区块：盘面立即成为快照内容（进程崩溃也不丢回滚），
+     * 不受 {@code saveAllChunks} 的可见性/冷却过滤影响。直写走原版标准管道、写监听照常记账——
+     * 覆盖层已在前一步撤装清账，这些写入就是之后增量建点的「新基线」。
+     * 目标区块在重载步骤已全部同步读回内存；这里仍拿不到内存区块的坐标（重载失败）只能记一笔，
+     * 交给退出世界的生命周期落盘兜底。
      */
     private static void forceDirty(MinecraftServer server, List<Target> targets) {
         for (Target target : targets) {
@@ -1127,29 +1129,38 @@ public final class InPlaceRollback {
                 Rewind.LOGGER.warn("Rewind: failed to mark saved data dirty after rollback", t);
             }
         }
-        // 直写保障：丢弃窗口之外走一遍标准落盘（写监听记下快照态，时间线对齐）。
+        // 直写保障：丢弃窗口之外走一遍标准落盘（写监听记下回滚后的状态，时间线对齐）。
         // 显式落盘不受 saveAllChunks 的可见性/冷却过滤影响，退出世界前盘上已是快照内容。
         Rewind.endDiscard();
-        try {
-            for (Target target : targets) {
-                try {
-                    ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
-                    ChunkMapAccess access = mapAccess(chunkMap);
-                    var holder = access.rewind$getUpdatingChunkIfPresent(target.pos.toLong());
-                    if (holder == null) {
-                        continue;
-                    }
-                    if (holder.getLatestChunk() instanceof LevelChunk chunk) {
-                        access.rewind$saveDirect(chunk);
-                        holder.refreshAccessibility();
-                    }
-                } catch (Throwable t) {
-                    Rewind.LOGGER.warn("Rewind: failed to directly save chunk {} after rollback", target.pos, t);
+        int missing = 0;
+        for (Target target : targets) {
+            try {
+                ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
+                ChunkMapAccess access = mapAccess(chunkMap);
+                var holder = access.rewind$getUpdatingChunkIfPresent(target.pos.toLong());
+                if (holder == null) {
+                    // 重载失败的坐标：内存里没有区块可写，交给退出世界的生命周期落盘兜底
+                    missing++;
+                    continue;
                 }
+                if (holder.getLatestChunk() instanceof LevelChunk chunk) {
+                    access.rewind$saveDirect(chunk);
+                    holder.refreshAccessibility();
+                }
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: failed to directly save chunk {} after rollback", target.pos, t);
             }
-            // 直写只是进队列：排空才真正落盘，否则崩在队列里就丢了
+        }
+        if (missing > 0) {
+            Rewind.LOGGER.warn(
+                    "Rewind: {} target chunks are not in memory after rollback; leaving them to the world-exit save",
+                    missing);
+        }
+        // 直写只是进队列：排空才真正落盘，否则崩在队列里就丢了
+        try {
             flushWorkers(server);
         } finally {
+            // 直写完成 = 新基线：写监听记下的就是之后的增量起点，撤装后重记
             RewindState.clearStorageJournal();
         }
     }
@@ -1159,17 +1170,17 @@ public final class InPlaceRollback {
     /**
      * 玩家 / 时间天气。位置见 {@link #run} 里的注释：必须排在 holder 重建之后、区块成批重发之前。
      */
-    private static void restoreWorldAndPlayers(MinecraftServer server, Path slotDir, Result result) {
+    private static void restoreWorldAndPlayers(MinecraftServer server, Result result) {
         long stepNanos = System.nanoTime();
         try {
-            result.restoredWorldData = restoreWorldData(server, slotDir);
+            result.restoredWorldData = restoreWorldData(server);
         } catch (Throwable t) {
             Rewind.LOGGER.error("Rewind: failed to restore world data in place", t);
         }
         result.stateWorldMs = millisSince(stepNanos);
         stepNanos = System.nanoTime();
         try {
-            result.restoredPlayers = restorePlayers(server, slotDir);
+            result.restoredPlayers = restorePlayers(server);
         } catch (Throwable t) {
             Rewind.LOGGER.error("Rewind: failed to restore players in place", t);
         }
@@ -1177,12 +1188,17 @@ public final class InPlaceRollback {
     }
 
     /** 时间 / 天气 / 出生点来自 level.dat；原地回滚不改磁盘上的 level.dat，直接把值写进活着的 WorldData。 */
-    private static boolean restoreWorldData(MinecraftServer server, Path slotDir) throws IOException {
-        Path file = slotDir.resolve("level.dat");
-        if (!Files.isRegularFile(file)) {
+    private static boolean restoreWorldData(MinecraftServer server) {
+        String key = cc.sighs.mixin.DataJournalMixins.savedataKey(
+                server.getWorldPath(LevelResource.LEVEL_DATA_FILE).toFile());
+        if (!RewindState.dataCover().covers(key)) {
             return false;
         }
-        CompoundTag data = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap()).getCompound("Data");
+        Object served = RewindState.dataCover().serve(key);
+        if (!(served instanceof CompoundTag levelTag)) {
+            return false;
+        }
+        CompoundTag data = levelTag.getCompound("Data");
         ServerLevel overworld = server.overworld();
         if (overworld.getLevelData() instanceof ServerLevelData levelData) {
             // 游戏刻在 level.dat 里的键是 "Time"，不是 "GameTime"——后者只是 getGameTime() 那个 getter
@@ -1210,14 +1226,18 @@ public final class InPlaceRollback {
     }
 
     /** 玩家状态从快照的 playerdata 读回来；原版没有「重读玩家」的入口，只能 load 之后手动补齐客户端同步。 */
-    private static int restorePlayers(MinecraftServer server, Path slotDir) throws IOException {
+    private static int restorePlayers(MinecraftServer server) {
         int restored = 0;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            Path file = slotDir.resolve("playerdata").resolve(player.getUUID() + ".dat");
-            if (!Files.isRegularFile(file)) {
+            String key = cc.sighs.mixin.DataJournalMixins.playerKey(player.getStringUUID());
+            if (!RewindState.dataCover().covers(key)) {
                 continue;
             }
-            restorePlayer(server, player, NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap()));
+            Object served = RewindState.dataCover().serve(key);
+            if (!(served instanceof CompoundTag tag)) {
+                continue;
+            }
+            restorePlayer(server, player, tag.copy());
             restored++;
         }
         return restored;
@@ -1349,8 +1369,8 @@ public final class InPlaceRollback {
      *
      * @param dataFiles 本次覆盖到的存档数据文件相对路径（灌装时收集，给日志用）
      */
-    private static void restoreSavedData(MinecraftServer server, Path slotDir, List<String> dataFiles) {
-        SavedDataRollback.restore(new SavedDataHook(server, slotDir), dataFiles);
+    private static void restoreSavedData(MinecraftServer server, List<String> dataFiles) {
+        SavedDataRollback.restore(new SavedDataHook(server), dataFiles);
     }
 
     /**
@@ -1359,11 +1379,9 @@ public final class InPlaceRollback {
      */
     private static final class SavedDataHook implements SavedDataRollback.Hook {
         private final MinecraftServer server;
-        private final Path slotDir;
 
-        SavedDataHook(MinecraftServer server, Path slotDir) {
+        SavedDataHook(MinecraftServer server) {
             this.server = server;
-            this.slotDir = slotDir;
         }
 
         /** 作废「没被强引用」的条目：下一次访问经覆盖层读快照；返回摘掉的条数。 */
@@ -1392,13 +1410,8 @@ public final class InPlaceRollback {
                 clearLevelAttachments(level);
                 LevelAttachmentsSavedData.init(level);
             }
-            // 记分板：缓存条目留着，只把内容灌回活着的记分板
-            try {
-                restoreScoreboard(server, slotDir);
-            } catch (IOException e) {
-                // Hook 的方法签名不带受检异常；包一层，让调用方的 catch (Throwable) 照旧记到同一处日志
-                throw new UncheckedIOException(e);
-            }
+            // 记分板：缓存条目留着，只把内容灌回活着的记分板（数据来自内存覆盖层）
+            restoreScoreboard(server);
         }
 
         @Override
@@ -1420,12 +1433,22 @@ public final class InPlaceRollback {
      * 这里故意 {@code new} 一个临时实例来 {@code load}：构造函数不加脏标记回调（加回调的是
      * {@code ServerScoreboard.createData()}），不会随着回滚次数越攒越多。
      */
-    private static void restoreScoreboard(MinecraftServer server, Path slotDir) throws IOException {
-        Path file = slotDir.resolve("data").resolve("scoreboard.dat");
-        if (!Files.isRegularFile(file)) {
+    private static void restoreScoreboard(MinecraftServer server) {
+        DimensionDataStorageAccess access =
+                (DimensionDataStorageAccess) (Object) server.overworld().getDataStorage();
+        File dataFolder = access.rewind$dataFolder();
+        if (dataFolder == null) {
             return;
         }
-        CompoundTag data = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap()).getCompound("data");
+        String key = cc.sighs.mixin.DataJournalMixins.savedataKey(new File(dataFolder, "scoreboard.dat"));
+        if (!RewindState.dataCover().covers(key)) {
+            return;
+        }
+        Object served = RewindState.dataCover().serve(key);
+        if (!(served instanceof CompoundTag full)) {
+            return;
+        }
+        CompoundTag data = full.getCompound("data");
         ServerScoreboard scoreboard = server.getScoreboard();
         for (Objective objective : new ArrayList<>(scoreboard.getObjectives())) {
             scoreboard.removeObjective(objective);

@@ -14,10 +14,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>线程安全：原版 `store` / `loadAsync` 都跑在 `IOWorker` 的 mailbox 上串行，
  * 但回滚引擎与快照线程也可能读写这里，所以内部是 `ConcurrentHashMap`，调用方不需要额外加锁。
  *
- * <p>生命周期（谁建、谁清、开关在哪挂）还没接线：按 TODO 的路线，条目由各版本节点的 mixin
- * 经 `onWritten` 登记，覆盖窗口的开关挂在 `RewindState` 的 `beginDiscard` / `endDiscard` 同处，
- * 「下次写自动同步」（新数据落盘后丢弃旧覆盖条目）由回滚收尾驱动 `discard`。
- * 在接线完成之前，这个类只做纯内存账本，不参与任何回滚路径。
+ * <p>生命周期已全程接线，实例都挂在 {@link cc.sighs.rewind.common.RewindState}：
+ * 写侧各版本节点的 mixin 在 `IOWorker.store` / `SavedData` 写盘点经 `onWritten` 登记变更集；
+ * 读侧在武装窗口内由 `serve` 短路喂出快照，未命中放行走原版；建点成功后
+ * `clearStorageJournal` 清账本、以新存档点为基线重记；回滚收尾 `armStorageCover` /
+ * `disarmStorageCover` 开关覆盖窗口，撤装连账本一起清。
  */
 public final class StorageOverlay implements StorageWriteSink, StorageReadSource {
     /** 覆盖条目 key：种类 + 维度 + 区块，三者缺一不可（同坐标在不同维度/种类下是不同条目）。 */

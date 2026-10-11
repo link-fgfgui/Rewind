@@ -21,14 +21,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /**
  * 回滚窗口内跳过「写了也会被覆盖」的世界落盘。
  *
- * <p>F8 的流程是「关掉世界 → 用快照覆盖存档文件 → 重新开世界」。关世界那一步原版会把整个世界
- * 存一遍（区块 / 实体 / 玩家数据 / 维度数据），而这些数据马上就会被快照整体覆盖掉——大存档上是纯浪费，
- * 而且会在覆盖前又改一遍文件的 mtime，害得反向增量还原误判成「变了」。
+ * <p>F8 走的原地回滚不关世界：「强制卸载 → 内存直解灌装 → 重建重载 → 内存状态还原 → 标脏直写」。
+ * 卸载与重载这段窗口里，原版流水线仍会把「马上要被覆盖掉的未来脏状态」往盘上刷
+ * （卸载收尾的 {@code ChunkMap.save}、POI flush、实体/玩家收尾写入），所以窗口期内这些落盘
+ * 要整段跳过——不拦内存变更，只拦「写了也会被丢弃」的磁盘写入；被丢弃的写入也不进写账本。
+ * 「关世界 → 覆盖 → 重开」那条回退路径复用同一个窗口。
  *
- * <p>必须在回滚前把 {@link Rewind#beginDiscard()} 打开，覆盖完成（或任何失败路径）立刻
+ * <p>窗口由回滚编排显式开关：开始前 {@link Rewind#beginDiscard()} 打开，整段收尾（或任何失败路径）
  * {@link Rewind#endDiscard()} 关掉，否则后续正常游玩的世界保存会被一起跳过。
- * 这些注入只跳过写盘，不阻止关句柄：{@code IOWorker.close()} / {@code RegionFile.close()} 照常执行，
- * 所以覆盖 .mca 依然是安全的。
+ * 这些注入只跳过写盘，不阻止关句柄：{@code IOWorker.close()} / {@code RegionFile.close()} 照常执行
+ * （关世界那条路覆盖 .mca 依然安全）。
  */
 public final class RollbackDiscardMixins {
     private RollbackDiscardMixins() {

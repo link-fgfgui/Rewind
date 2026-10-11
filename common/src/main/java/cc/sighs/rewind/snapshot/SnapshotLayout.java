@@ -65,16 +65,16 @@ public final class SnapshotLayout {
     public static final String STATUS_COMPLETE = "complete";
 
     private static final String LOCK_FILE_NAME = "session.lock";
+    /** 进度目录（per-player JSON，原版 GSON 直写）：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String ADVANCEMENTS_DIR = "advancements";
+    /** 统计目录（per-player JSON，Commons IO 直写）：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String STATS_DIR = "stats";
+    /** 存档图标（世界选择界面那张图，PNG）：`rollback.skipNonNbtMca` 开着时不进存档点。 */
+    private static final String ICON_FILE_NAME = "icon.png";
     /** 玩家数据目录（≤ 1.21.1）。 */
     private static final String PLAYER_DATA_DIR = "playerdata";
     /** 玩家数据目录（26.1 起搬到这里，见 {@code LevelResource.PLAYER_DATA_DIR}）。 */
     private static final String PLAYERS_DATA_DIR = "players/data";
-    /** 进度目录（per-player JSON，原版 GSON 直写）。 */
-    private static final String ADVANCEMENTS_DIR = "advancements";
-    /** 统计目录（per-player JSON，Commons IO 直写）。 */
-    private static final String STATS_DIR = "stats";
-    /** 存档图标（世界选择界面那张图，PNG）。 */
-    private static final String ICON_FILE_NAME = "icon.png";
 
     /** 根目录下 {@code level<随机数字>.dat}，level.dat 写入时的临时文件。 */
     private static final Pattern ROOT_LEVEL_TEMP = Pattern.compile("level\\d+\\.dat");

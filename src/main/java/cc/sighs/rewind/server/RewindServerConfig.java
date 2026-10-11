@@ -79,8 +79,8 @@ public final class RewindServerConfig {
             "Rollback behaviour.",
             KEY_SYNC_RECIPE_BOOK + "：回溯时重新同步玩家的配方书。",
             KEY_SYNC_RECIPE_BOOK + ": Re-sync the player's recipe book on rollback.",
-            KEY_SYNC_CHUNKS_NEAR_PLAYER + "：回溯时只同步读回玩家视野内的区块。",
-            KEY_SYNC_CHUNKS_NEAR_PLAYER + ": On rollback, sync-load only chunks near the player.",
+            KEY_SYNC_CHUNKS_NEAR_PLAYER + "：已废弃，改它没有效果（回滚为保证覆盖层命中一律全部同步读回）；保留只为兼容旧配置文件。",
+            KEY_SYNC_CHUNKS_NEAR_PLAYER + ": Deprecated, has no effect (rollback always sync-loads every affected chunk); kept for old config files.",
             KEY_ROLLBACK_ON_DEATH + "：死亡后自动回溯到时间线上最近的那个节点。",
             KEY_ROLLBACK_ON_DEATH + ": Roll back to the nearest node on the timeline after death.",
             KEY_IN_PLACE_ROLLBACK + "：原地回滚：世界不关、不重登，直接在活着的服务器里倒回去。模组数据看起来没回滚就关掉它。",
@@ -247,8 +247,8 @@ public final class RewindServerConfig {
                 .define("syncRecipeBook", RollbackSettings.DEFAULT_SYNC_RECIPE_BOOK);
 
         syncChunksNearPlayer = builder
-                .comment("回溯时只同步读回玩家视野内的区块。",
-                        "On rollback, sync-load only chunks near the player.")
+                .comment("已废弃，改它没有效果（回滚为保证覆盖层命中一律全部同步读回）；保留只为兼容旧配置文件。",
+                        "Deprecated, has no effect (rollback always sync-loads every affected chunk); kept for old config files.")
                 .define("syncChunksNearPlayer", RollbackSettings.DEFAULT_SYNC_CHUNKS_NEAR_PLAYER);
 
         rollbackOnDeath = builder
@@ -419,12 +419,12 @@ public final class RewindServerConfig {
         return RollbackSettings.syncRecipeBook();
     }
 
-    /** 回溯时是不是只同步读回玩家视野内的受影响区块。 */
+    /** 回溯时是不是只同步读回玩家视野内的受影响区块。已废弃：回滚引擎不再读它（恒为全部同步读回）。 */
     public static boolean syncChunksNearPlayer() {
         return RollbackSettings.syncChunksNearPlayer();
     }
 
-    /** 改「只同步读视野内区块」开关并立刻落盘。 */
+    /** 改「只同步读视野内区块」开关并立刻落盘。已废弃（见 {@link #syncChunksNearPlayer()}），仅保留读写兼容。 */
     public static void setSyncChunksNearPlayer(boolean value) {
         RollbackSettings.setSyncChunksNearPlayer(value);
         //? if fabric {

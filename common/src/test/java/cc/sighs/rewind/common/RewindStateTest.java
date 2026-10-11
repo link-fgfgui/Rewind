@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import cc.sighs.rewind.common.spi.StorageKind;
@@ -67,26 +66,20 @@ class RewindStateTest {
     }
 
     @Test
-    void disarmClearsBaselinesAndDataCover() {
-        RewindState.noteColdBaseline(StorageKind.CHUNK, "minecraft:overworld", POS, new Object());
+    void disarmClearsDataCover() {
         RewindState.dataCover().onWritten("player|uuid", new Object());
-        assertEquals(1, RewindState.coldBaselines().size());
         assertEquals(1, RewindState.dataCover().size());
         RewindState.armStorageCover();
         RewindState.disarmStorageCover();
-        assertEquals(0, RewindState.coldBaselines().size());
         assertEquals(0, RewindState.dataCover().size());
     }
 
     @Test
-    void checkpointClearDropsBaselinesButKeepsFrozen() {
-        Object base = new Object();
-        RewindState.noteColdBaseline(StorageKind.CHUNK, "minecraft:overworld", POS, base);
+    void recordChunkWriteRegistersJournal() {
         RewindState.recordChunkWrite(StorageKind.CHUNK, "minecraft:overworld", POS, new Object());
+        assertEquals(1, RewindState.storageJournal().size());
         RewindState.clearStorageJournal();
-        assertEquals(0, RewindState.coldBaselines().size());
-        assertSame(base, RewindState.frozenBase(StorageKind.CHUNK, "minecraft:overworld", POS));
-        RewindState.frozenBases().clear();
+        assertEquals(0, RewindState.storageJournal().size());
     }
 
     @TempDir

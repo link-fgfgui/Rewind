@@ -30,8 +30,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 误分类比漏记更危险）。删除类写入（`chunkData == null`）记删除标记，不断言。
  * 丢弃窗口（回滚卸载期）内的写入是“卸掉的未来”，不记账不冻结（撤装时本来就要清）。
  *
- * <p>线程：写注入跑在 `store` 的调用方线程（通常是服务端线程），读时基线登记跑在
- * mailbox 线程（`loadAsync` future 完成时）；账本本身是线程安全的，两边都不用加锁。
+ * <p>线程：注入跑在 `store` 的调用方线程（通常是服务端线程）；账本本身是线程安全的，不用加锁。
  */
 public final class StorageJournalMixins {
     private StorageJournalMixins() {
@@ -140,57 +139,6 @@ public final class StorageJournalMixins {
             }
             if (isCoveredDeleted(chunkPos)) {
                 cir.setReturnValue(CompletableFuture.completedFuture(Optional.empty()));
-            }
-        }
-
-        /**
-         * 读时登记冷区块基线（Copy-on-First-Write 的前半段）。
-         *
-         * <p>武装/丢弃窗口内不登记（回滚重载读到的是快照，不是基线）。平时把返回 future
-         * 包一层：完成时若该坐标自建点后还没写过，就把读到的数据拷一份登记为基线；
-         * 若从未被写过，回滚时它不在变更集内、直接放行走盘，完全不占快照资源。
-         * 包裝失败（原版返回 null 之类）就当没拦住，原样返回。
-         */
-        @Inject(
-                method = "loadAsync(Lnet/minecraft/world/level/ChunkPos;)Ljava/util/concurrent/CompletableFuture;",
-                at = @At("RETURN"),
-                cancellable = true)
-        private void rewind$noteColdBaseline(
-                ChunkPos chunkPos, CallbackInfoReturnable<CompletableFuture<Optional<CompoundTag>>> cir) {
-            try {
-                if (RewindState.isDiscarding() || RewindState.isStorageCoverArmed()) {
-                    return;
-                }
-                CompletableFuture<Optional<CompoundTag>> original = cir.getReturnValue();
-                if (original == null) {
-                    return;
-                }
-                RegionStorageInfo info = this.storageInfo();
-                StorageKind kind = kindOf(info.type());
-                if (kind == null) {
-                    return;
-                }
-                String dimension = info.dimension().location().toString();
-                long pos = chunkPos.toLong();
-                if (!RewindState.needsColdBaseline(kind, dimension, pos)) {
-                    return;
-                }
-                final StorageKind finalKind = kind;
-                final String finalDimension = dimension;
-                cir.setReturnValue(original.thenApply(optional -> {
-                    try {
-                        if (optional != null && optional.isPresent() && optional.get() != null
-                                && RewindState.needsColdBaseline(finalKind, finalDimension, pos)) {
-                            RewindState.noteColdBaseline(finalKind, finalDimension, pos,
-                                    optional.get().copy());
-                        }
-                    } catch (Throwable ignored) {
-                        // 基线登记绝不能污染读盘结果
-                    }
-                    return optional;
-                }));
-            } catch (Throwable ignored) {
-                // 包装失败就当没拦住，原 future 照走
             }
         }
 
