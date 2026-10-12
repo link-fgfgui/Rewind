@@ -24,7 +24,7 @@ public final class Xxh64 {
         return hash(data, 0, data == null ? 0 : data.length, 0L);
     }
 
-    public static long hash(byte[] data, int offset, int length, long seed) {
+    private static long hash(byte[] data, int offset, int length, long seed) {
         if (data == null || length <= 0) {
             return avalanche(seed + P5);
         }

@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import cc.sighs.rewind.common.RewindLog;
+import cc.sighs.rewind.common.config.RollbackSettings;
 
 /**
  * 整树完全重烘焙 GC（TODO2 §4 Full Tree Re-bake）。
@@ -37,11 +38,6 @@ public final class FullTreeRebakeWorker {
     private FullTreeRebakeWorker() {
     }
 
-    /** 重烘焙进度回调（UI 线程由调用方转交）。 */
-    public interface Progress {
-        void onStep(String message);
-    }
-
     /** 重烘焙结果。 */
     public static final class Result {
         public final int liveSlots;
@@ -49,16 +45,13 @@ public final class FullTreeRebakeWorker {
         public final long bytesBefore;
         public final long bytesAfter;
         public final long freedBytes;
-        public final List<String> rebakedSlots;
 
-        Result(int liveSlots, int droppedTombstones, long bytesBefore, long bytesAfter,
-                List<String> rebakedSlots) {
+        Result(int liveSlots, int droppedTombstones, long bytesBefore, long bytesAfter) {
             this.liveSlots = liveSlots;
             this.droppedTombstones = droppedTombstones;
             this.bytesBefore = bytesBefore;
             this.bytesAfter = bytesAfter;
             this.freedBytes = Math.max(0L, bytesBefore - bytesAfter);
-            this.rebakedSlots = rebakedSlots;
         }
 
         public String summary() {
@@ -124,16 +117,12 @@ public final class FullTreeRebakeWorker {
      * 执行整树重烘焙（同步，后台线程调用）。
      *
      * @param worldRoot 存档目录
-     * @param progress  可为 null
      */
-    public static Result rebake(Path worldRoot, Progress progress) throws IOException {
+    public static Result rebake(Path worldRoot) throws IOException {
         // 启动自愈先行：残留 .compact_old/.compact_tmp 不应污染本次重烘焙
         SnapshotSelfHealing.heal(worldRoot);
         Path snapshots = SnapshotLayout.snapshotRoot(worldRoot);
         Path tmpRoot = SnapshotLayout.compactTmpDir(worldRoot);
-        if (Files.isDirectory(tmpRoot)) {
-            SnapshotSelfHealing.discardTmp(worldRoot);
-        }
         Files.createDirectories(tmpRoot);
         // 注意：tmpRoot 与 snapshots 同级（worldRoot 下），zpack 路径解析用各自根
         long bytesBefore = directorySize(snapshots);
@@ -157,27 +146,37 @@ public final class FullTreeRebakeWorker {
         for (String slot : live) {
             newParent.put(slot, nearestLiveAncestor(index, slot, live));
         }
+        // 按新树拓扑序（父先子后）逐个：解算 → 重算差分写入 tmp → 立即校验。
+        // 解算与重烘焙同一槽位一次完成：全部存活槽位同时驻留内存会让峰值 ≈ 全世界 NBT；
+        // 只保留「还有未处理孩子」的父槽位 raw（线性时间线通常只有 1~2 份）。
         ZPackChain chain = new ZPackChain(snapshots);
-        Map<String, Map<String, byte[]>> resolved = new LinkedHashMap<>();
+        ZPackChain tmpChain = new ZPackChain(tmpRoot);
+        Map<String, Integer> pendingChildren = new LinkedHashMap<>();
         for (String slot : live) {
-            step(progress, "resolving " + slot);
-            resolved.put(slot, chain.resolveAll(slot, index));
+            String parent = newParent.get(slot);
+            if (parent != null && !parent.isEmpty()) {
+                pendingChildren.merge(parent, 1, Integer::sum);
+            }
         }
-        // 按拓扑序逐个重算差分写入 tmp（父先子后，保证新父 raw 已就绪）
-        Map<String, Map<String, byte[]>> rebased = new LinkedHashMap<>();
-        // 每个已重烘焙槽位实际写成 MODE_FULL 的 key 集合（关键帧锚点）：
-        // chainDepth 据此截断差分链，FULL 锚点之后深度归零
+        // 每个已重烘焙槽位：存在哪些 key（链深判定的存在性检查）与其中写为 MODE_FULL
+        // 的 key（关键帧锚点，chainDepth 据此截断差分链）。都是 key 字符串级元数据，
+        // 不驻留 NBT 字节。
+        Map<String, Set<String>> slotKeys = new LinkedHashMap<>();
         Map<String, Set<String>> fullKeyframes = new LinkedHashMap<>();
+        // 只有「还有未处理孩子」的父槽位才保留 raw 字节（子代字典来源）；线性时间线
+        // 通常只驻留 1~2 份，全部存活槽位同时驻留会让 GC 峰值 ≈ 全世界 NBT。
+        Map<String, Map<String, byte[]>> parentRaws = new LinkedHashMap<>();
         SnapshotIndex newIndex = SnapshotIndex.empty();
         newIndex.setHead(remapHead(index.getHead(), live));
         newIndex.setLastRollbackAt(index.getLastRollbackAt());
-        List<String> rebaked = new ArrayList<>();
         for (String slot : live) {
-            step(progress, "rebaking " + slot);
             SnapshotMeta meta = index.get(slot).copy();
             meta.parentSlot = newParent.get(slot);
-            Map<String, byte[]> full = resolved.get(slot);
-            Map<String, byte[]> parentRaw = rebased.get(meta.parentSlot);
+            Map<String, byte[]> full = chain.resolveAll(slot, index);
+            // quick 槽位「只压缩、不 diff」（与建点侧同规则，TODO-ZSTD §3）：不需要父 raw、
+            // 不算链深，重烘焙不会把它打回 DELTA。
+            boolean noDelta = SnapshotLayout.SLOT_QUICK.equals(slot);
+            Map<String, byte[]> parentRaw = noDelta ? null : parentRaws.get(meta.parentSlot);
             ZPack.Writer writer = new ZPack.Writer();
             List<String> keys = new ArrayList<>(full.keySet());
             Collections.sort(keys);
@@ -185,18 +184,19 @@ public final class FullTreeRebakeWorker {
             for (String key : keys) {
                 byte[] raw = full.get(key);
                 byte[] dict = parentRaw == null ? null : parentRaw.get(key);
-                boolean forceFull = dict == null || ZPackChain.needsKeyframe(
-                        chainDepth(rebased, newIndex, fullKeyframes, meta.parentSlot, key));
+                boolean forceFull = noDelta || dict == null || ZPackChain.needsKeyframe(
+                        chainDepth(slotKeys, fullKeyframes, newIndex, meta.parentSlot, key));
                 // 由 key 还原 (type,id,chunkPos)
                 ZPack.ParsedKey parsed = ZPack.parseKey(key);
                 ZPack.Entry entry = ZPack.buildEntry(parsed.targetType, parsed.id, parsed.chunkPos,
-                        raw, dict, forceFull, ZstdDelta.DEFAULT_LEVEL);
+                        raw, dict, forceFull, RollbackSettings.zstdLevel());
                 // 以实际写出的模式记账（含膨胀兜底自动 FULL），供后代链深判定
                 if (entry.mode == ZPack.MODE_FULL) {
                     slotFullKeys.add(key);
                 }
                 writer.add(entry);
             }
+            slotKeys.put(slot, new java.util.HashSet<>(keys));
             fullKeyframes.put(slot, slotFullKeys);
             byte[] zpackBytes = writer.toBytes();
             Path tmpZpack = tmpRoot.resolve(slot + SnapshotLayout.ZPACK_SUFFIX);
@@ -208,23 +208,29 @@ public final class FullTreeRebakeWorker {
                         Files.readAllBytes(srcInv));
             }
             newIndex.put(meta, slot);
-            rebased.put(slot, full);
-            rebaked.add(slot);
+            // 立即校验本槽位：tmp 链解出必须与重烘焙前逐字节一致（含逐包 XXH64 比对）
+            verifySlot(tmpChain, newIndex, slot, full);
+            // 释放：本槽位还有未处理的孩子时才留作子代的字典来源
+            if (pendingChildren.getOrDefault(slot, 0) > 0) {
+                parentRaws.put(slot, full);
+            }
+            String parent = meta.parentSlot;
+            if (parent != null && !parent.isEmpty()) {
+                int remaining = pendingChildren.merge(parent, -1, Integer::sum);
+                if (remaining <= 0) {
+                    parentRaws.remove(parent);
+                }
+            }
         }
         newIndex.save(tmpRoot.resolve(SnapshotLayout.INDEX_FILE_NAME));
         // 旧路负载原样保留：存活槽位的槽位目录（含 .dat / datapacks 等松散文件）、
         // 清单与块映射必须跟过去——否则切换后回滚旧路（槽位 .dat 直读、块存储解码、
         // 在线玩家/世界数据恢复）无米下锅。墓碑槽位的一律不拷（即释放）。
         // blocks/ 整体拷过去再按新映射 GC（内容寻址共享，逐块挑着拷反而更贵）。
-        step(progress, "carrying legacy payload");
         carryLegacyPayload(worldRoot, tmpRoot, live);
-        // 校验：全部新 zpack 全量试解压 + XXH64 比对 + 与重烘焙前逐字节一致
-        // ＋拷过去的旧路文件逐字节一致
-        step(progress, "verifying " + rebaked.size() + " packs");
-        verifyTmp(worldRoot, tmpRoot, newIndex, resolved);
+        // 搬运校验：拷过去的清单/映射/槽位文件与源逐字节一致
         verifyCarriedPayload(worldRoot, tmpRoot, live);
         // 三阶段切换（kill 窗口定位口：先打让位日志，再打就位日志）
-        step(progress, "swapping directories");
         RewindLog.LOGGER.info("Rewind: compact relaying {} -> .compact_old ({} live slots)",
                 SnapshotLayout.ROOT_DIR_NAME, live.size());
         SnapshotSelfHealing.swapInCompacted(worldRoot);
@@ -232,19 +238,12 @@ public final class FullTreeRebakeWorker {
         // 后台清理旧目录（同步做，失败由下次 heal 兜底）
         SnapshotSelfHealing.cleanupOld(worldRoot);
         long bytesAfter = directorySize(snapshots);
-        step(progress, "done");
-        Result result = new Result(live.size(), dropped, bytesBefore, bytesAfter, rebaked);
+        Result result = new Result(live.size(), dropped, bytesBefore, bytesAfter);
         RewindLog.LOGGER.info("Rewind: compact done: {}", result.summary());
         return result;
     }
 
     // ---------------------------------------------------------- 内部
-
-    private static void step(Progress progress, String message) {
-        if (progress != null) {
-            progress.onStep(message);
-        }
-    }
 
     /** 拓扑序：父先子后（按 parent 深度排序，环保护上限）。 */
     static List<String> topoOrder(SnapshotIndex index) {
@@ -263,7 +262,7 @@ public final class FullTreeRebakeWorker {
     private static int topoDepth(SnapshotIndex index, String slot) {
         int depth = 0;
         String current = slot;
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < SnapshotIndex.TIMELINE_WALK_LIMIT; i++) {
             SnapshotMeta meta = index.get(current);
             if (meta == null || meta.parentSlot == null || meta.parentSlot.isEmpty()) {
                 break;
@@ -282,7 +281,7 @@ public final class FullTreeRebakeWorker {
         SnapshotMeta meta = index.get(slot);
         String parent = meta == null ? "" : meta.parentSlot;
         int steps = 0;
-        while (parent != null && !parent.isEmpty() && steps++ < 64) {
+        while (parent != null && !parent.isEmpty() && steps++ < SnapshotIndex.TIMELINE_WALK_LIMIT) {
             if (liveSet.contains(parent)) {
                 return parent;
             }
@@ -300,22 +299,22 @@ public final class FullTreeRebakeWorker {
     }
 
     /**
-     * 新树下的连续 DELTA 深度（rebased 内自顶向下数）。
+     * 新树下的连续 DELTA 深度（沿新父链自下向上数）。
      *
      * <p>以重烘焙<b>实际写出</b>的条目模式为准：祖先对应 key 被写成 FULL 关键帧
      * （forceFull 或膨胀兜底）时立即截断——该锚点不参与差分链，深度归零重数。
      * 与建点侧 {@link ZPackChain#deltaDepth} 同语义，避免深链拍平后深度累积
      * 导致全体退化 FULL。
      */
-    private static int chainDepth(Map<String, Map<String, byte[]>> rebased,
-            SnapshotIndex newIndex, Map<String, Set<String>> fullKeyframes,
+    private static int chainDepth(Map<String, Set<String>> slotKeys,
+            Map<String, Set<String>> fullKeyframes, SnapshotIndex newIndex,
             String parentSlot, String key) {
         int depth = 0;
         String current = parentSlot;
         int steps = 0;
-        while (current != null && !current.isEmpty() && steps++ < 64) {
-            Map<String, byte[]> raw = rebased.get(current);
-            if (raw == null || !raw.containsKey(key)) {
+        while (current != null && !current.isEmpty() && steps++ < SnapshotIndex.TIMELINE_WALK_LIMIT) {
+            Set<String> keys = slotKeys.get(current);
+            if (keys == null || !keys.contains(key)) {
                 break;
             }
             Set<String> fullKeys = fullKeyframes.get(current);
@@ -333,25 +332,20 @@ public final class FullTreeRebakeWorker {
     }
 
     /**
-     * 校验临时区：全部新 zpack 全量试解压（内含逐包 XXH64 比对）后，
-     * 再与重烘焙前内存态做 {@code Arrays.equals} 逐字节一致比对。
+     * 校验单个槽位：tmp 链解出（内含逐包 XXH64 比对）后，与重烘焙前内存态
+     * 做 {@code Arrays.equals} 逐字节一致比对。
      */
-    private static void verifyTmp(Path worldRoot, Path tmpRoot, SnapshotIndex newIndex,
-            Map<String, Map<String, byte[]>> expected) throws IOException {
-        ZPackChain tmpChain = new ZPackChain(tmpRoot);
-        for (Map.Entry<String, Map<String, byte[]>> e : expected.entrySet()) {
-            String slot = e.getKey();
-            Map<String, byte[]> want = e.getValue();
-            Map<String, byte[]> got = tmpChain.resolveAll(slot, newIndex);
-            if (got.size() != want.size()) {
-                throw new IOException("rebake verify failed for " + slot
-                        + ": size " + got.size() + " != " + want.size());
-            }
-            for (Map.Entry<String, byte[]> entry : want.entrySet()) {
-                byte[] actual = got.get(entry.getKey());
-                if (actual == null || !java.util.Arrays.equals(actual, entry.getValue())) {
-                    throw new IOException("rebake verify mismatch for " + slot + " key " + entry.getKey());
-                }
+    private static void verifySlot(ZPackChain tmpChain, SnapshotIndex newIndex, String slot,
+            Map<String, byte[]> expected) throws IOException {
+        Map<String, byte[]> got = tmpChain.resolveAll(slot, newIndex);
+        if (got.size() != expected.size()) {
+            throw new IOException("rebake verify failed for " + slot
+                    + ": size " + got.size() + " != " + expected.size());
+        }
+        for (Map.Entry<String, byte[]> entry : expected.entrySet()) {
+            byte[] actual = got.get(entry.getKey());
+            if (actual == null || !java.util.Arrays.equals(actual, entry.getValue())) {
+                throw new IOException("rebake verify mismatch for " + slot + " key " + entry.getKey());
             }
         }
     }

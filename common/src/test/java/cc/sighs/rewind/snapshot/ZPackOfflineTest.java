@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -121,8 +122,8 @@ class ZPackOfflineTest {
     }
 
     private static byte[] readChunk(Path mca, int x, int z) throws Exception {
-        SnapshotChunkDecoder.Sector sector =
-                SnapshotChunkDecoder.readSectorFromBytes(Files.readAllBytes(mca), x, z);
+        SnapshotChunkDecoder.Sector sector = SnapshotChunkDecoder.readSector(
+                SnapshotChunkDecoder.SectorSource.ofBytes(Files.readAllBytes(mca)), x, z);
         assertNotNull(sector, "chunk (" + x + "," + z + ") 应存在");
         assertFalse(sector.external);
         return SnapshotChunkDecoder.decompress(sector.versionId, sector.compressed);
@@ -163,8 +164,9 @@ class ZPackOfflineTest {
         Files.write(worldRoot.resolve("data/oldmod.dat"), new byte[]{1});
         Files.write(worldRoot.resolve("region/c.0.1.mcc"), new byte[]{2});
 
-        SnapshotMirror.Result result = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
-        assertNotNull(result, "完备链应走纯 NBT 重建");
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
+        assertTrue(outcome.applied(), "完备链应走纯 NBT 重建: " + outcome.reason);
+        SnapshotMirror.Result result = outcome.result;
 
         Path mca = worldRoot.resolve("region/r.0.0.mca");
         assertArrayEquals(c00, readChunk(mca, 0, 0));
@@ -194,18 +196,22 @@ class ZPackOfflineTest {
         writeManifest("region/r.0.0.mca");
         Files.createDirectories(SnapshotLayout.slotDir(worldRoot, "quick"));
 
-        SnapshotMirror.Result result = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
-        assertNotNull(result);
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
+        assertTrue(outcome.applied(), outcome.reason);
+        SnapshotMirror.Result result = outcome.result;
         Path mca = worldRoot.resolve("region/r.0.0.mca");
         assertArrayEquals(c00, readChunk(mca, 0, 0));
-        assertTrue(SnapshotChunkDecoder.readSectorFromBytes(Files.readAllBytes(mca), 1, 0) == null,
+        assertTrue(SnapshotChunkDecoder.readSector(
+                        SnapshotChunkDecoder.SectorSource.ofBytes(Files.readAllBytes(mca)), 1, 0) == null,
                 "删除标记的区块不应出现在重建 region 里");
     }
 
     @Test
     void fallsBackWithoutPack() throws Exception {
         writeIndex("quick", 1L);
-        assertNull(ZPackOffline.rebuild(worldRoot, "quick", LAYOUT));
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
+        assertFalse(outcome.applied());
+        assertNotNull(outcome.reason);
     }
 
     @Test
@@ -218,7 +224,9 @@ class ZPackOfflineTest {
         Files.write(SnapshotLayout.zpackFile(worldRoot, "quick"), writer.toBytes());
         writeManifest("region/r.0.0.mca");
         Files.createDirectories(SnapshotLayout.slotDir(worldRoot, "quick"));
-        assertNull(ZPackOffline.rebuild(worldRoot, "quick", LAYOUT));
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
+        assertFalse(outcome.applied(), "未知维度布局应走 not-applicable");
+        assertTrue(outcome.reason.contains("mod:weird"));
     }
 
     @Test
@@ -228,10 +236,11 @@ class ZPackOfflineTest {
         writer.add(ZPack.buildEntry(ZPack.TYPE_CHUNK, DIM, pos(0, 0), nbt(1000, 1), null, true, 3));
         Files.createDirectories(SnapshotLayout.snapshotRoot(worldRoot));
         Files.write(SnapshotLayout.zpackFile(worldRoot, "quick"), writer.toBytes());
-        // 清单说 r.5.5.mca 存在，链里一个 chunk 都没有 → 链洞 → 回退
+        // 清单说 r.5.5.mca 存在，链里一个 chunk 都没有 → 链洞 → 抛异常（调用方回退并告警）
         writeManifest("region/r.0.0.mca", "region/r.5.5.mca");
         Files.createDirectories(SnapshotLayout.slotDir(worldRoot, "quick"));
-        assertNull(ZPackOffline.rebuild(worldRoot, "quick", LAYOUT));
+        assertThrows(java.io.IOException.class,
+                () -> ZPackOffline.rebuild(worldRoot, "quick", LAYOUT));
     }
 
     @Test
@@ -298,6 +307,21 @@ class ZPackOfflineTest {
             }
 
             @Override
+            public cc.sighs.rewind.common.spi.EncodedSector encodeChunkSector(Object tag) {
+                return null;
+            }
+
+            @Override
+            public Object decodeChunkSector(byte[] uncompressed) {
+                return null;
+            }
+
+            @Override
+            public byte[] encodeRawNbt(Object tag) {
+                return null;
+            }
+
+            @Override
             public String chunkDirRelative(cc.sighs.rewind.common.spi.StorageKind kind, String dimensionId) {
                 return LAYOUT.dirRelative(
                         ZPackCheckpoint.kindToType(kind), dimensionId);
@@ -340,8 +364,8 @@ class ZPackOfflineTest {
         Files.createDirectories(worldRoot.resolve("region"));
         Files.write(worldRoot.resolve("region/c.-1.-2.mcc"), new byte[]{7, 7, 7});
 
-        SnapshotMirror.Result result = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
-        assertNotNull(result);
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "quick", LAYOUT);
+        assertTrue(outcome.applied(), outcome.reason);
         assertArrayEquals(raw, readChunk(worldRoot.resolve("region/r.-1.-1.mca"), -1, -2));
         assertFalse(Files.exists(worldRoot.resolve("region/c.-1.-2.mcc")),
                 "过期 .mcc 必须被删掉");

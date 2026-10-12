@@ -125,11 +125,11 @@ public final class RollbackWarmup {
         // 回滚快路读 zpack 全量表：页缓存顺手摸热
         readPrefix(SnapshotLayout.zpackFile(worldRoot, slot), buffer);
         loadRollbackClasses();
-        // JNI 本地库在建点后预热（而非第一次 F8 时现解压加载）：纯绑定类，静态初始化只装载 native。
+        // zstd-jni 本地库在建点后预热（而非第一次 F8 时现解压加载）：纯绑定类，静态初始化只装载 native。
         try {
             Class.forName("com.github.luben.zstd.Zstd", true, RollbackWarmup.class.getClassLoader());
         } catch (Throwable ignored) {
-            // JNI 缺席时回退 JDK Deflate，功能不受影响
+            // 加载失败会在首次实际调用时显式失败（硬依赖，无兜底路径）
         }
     }
 

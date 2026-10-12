@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -79,25 +78,24 @@ public final class SnapshotSelfHealing {
         boolean recoveredOld = false;
         boolean cleanedOld = false;
         boolean cleanedTmp = false;
-        Result result = new Result(false, false, false, false);
+        List<String> notes = new ArrayList<>();
         boolean hasSnapshots = Files.isDirectory(snapshots);
         boolean hasOld = Files.isDirectory(oldDir);
-        boolean hasTmp = Files.isDirectory(tmpDir);
         if (!hasSnapshots && hasOld) {
             // 6a 成功后被杀：原快照毫发无损地躺在 .compact_old，搬回来
-            moveDir(oldDir, snapshots);
+            AtomicFiles.moveDir(oldDir, snapshots);
             recoveredOld = true;
-            result.notes.add("recovered .compact_old -> rewind_snapshots");
+            notes.add("recovered .compact_old -> rewind_snapshots");
         } else if (hasSnapshots && hasOld) {
             // 6b 已完成、6c 未完成：新快照已生效，删残余旧目录
             deleteRecursively(oldDir);
             cleanedOld = true;
-            result.notes.add("removed residual .compact_old");
+            notes.add("removed residual .compact_old");
         }
         if (Files.isDirectory(tmpDir)) {
             deleteRecursively(tmpDir);
             cleanedTmp = true;
-            result.notes.add("removed interrupted .compact_tmp");
+            notes.add("removed interrupted .compact_tmp");
         }
         // 崩溃残留的原子替换临时文件：建点/镜像/zpack 写盘都是“写 tmp 再 move”，
         // 崩在 move 之前就剩一个 `.rewind-tmp`（槽位目录里与根目录下都可能有）。
@@ -106,10 +104,10 @@ public final class SnapshotSelfHealing {
         int temps = sweepTempFiles(snapshots);
         boolean cleanedTemps = temps > 0;
         if (cleanedTemps) {
-            result.notes.add("removed " + temps + " orphaned temp files");
+            notes.add("removed " + temps + " orphaned temp files");
         }
         Result done = new Result(recoveredOld, cleanedOld, cleanedTmp, cleanedTemps);
-        done.notes.addAll(result.notes);
+        done.notes.addAll(notes);
         return done;
     }
 
@@ -145,16 +143,16 @@ public final class SnapshotSelfHealing {
         }
         if (Files.isDirectory(snapshots)) {
             // 6a 让位（非空目录普通移动；失败直接抛，磁盘原文件不动）
-            moveDir(snapshots, oldDir);
+            AtomicFiles.moveDir(snapshots, oldDir);
         }
         try {
             // 6b 就位
-            moveDir(tmpDir, snapshots);
+            AtomicFiles.moveDir(tmpDir, snapshots);
         } catch (IOException e) {
             // 6b 失败：尝试把让位的目录搬回来，原快照不丢
             try {
                 if (!Files.isDirectory(snapshots) && Files.isDirectory(oldDir)) {
-                    moveDir(oldDir, snapshots);
+                    AtomicFiles.moveDir(oldDir, snapshots);
                 }
             } catch (IOException ignored) {
                 // 保留现场给下次 heal
@@ -169,18 +167,6 @@ public final class SnapshotSelfHealing {
             Path oldDir = SnapshotLayout.compactOldDir(worldRoot);
             if (Files.isDirectory(oldDir)) {
                 deleteRecursively(oldDir);
-            }
-        } catch (IOException ignored) {
-            // 下次 heal 会再试
-        }
-    }
-
-    /** 中途异常清理临时区，原磁盘文件 100% 不动。 */
-    public static void discardTmp(Path worldRoot) {
-        try {
-            Path tmpDir = SnapshotLayout.compactTmpDir(worldRoot);
-            if (Files.isDirectory(tmpDir)) {
-                deleteRecursively(tmpDir);
             }
         } catch (IOException ignored) {
             // 下次 heal 会再试
@@ -206,7 +192,7 @@ public final class SnapshotSelfHealing {
             public java.nio.file.FileVisitResult visitFile(Path file,
                     java.nio.file.attribute.BasicFileAttributes attrs) throws IOException {
                 String name = file.getFileName().toString();
-                if (name.endsWith(SnapshotMirror.TEMP_SUFFIX)) {
+                if (name.endsWith(AtomicFiles.TEMP_SUFFIX)) {
                     Files.deleteIfExists(file);
                     removed[0]++;
                 }
@@ -224,18 +210,6 @@ public final class SnapshotSelfHealing {
             removed[0]++;
         }
         return removed[0];
-    }
-
-    static void moveDir(Path from, Path to) throws IOException {        Path parent = to.getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
-        }
-        try {
-            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException atomicUnsupported) {
-            // 非空目录原子移动不受支持：退回普通移动（语义即重命名指针）
-            Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
-        }
     }
 
     static void deleteRecursively(Path dir) throws IOException {

@@ -113,7 +113,7 @@ class RealSaveZstdDeltaTest {
         byte[] badPayload = good.payload.clone();
         badPayload[badPayload.length / 2] ^= 0xFF;
         ZPack.Entry bad = new ZPack.Entry(good.targetType, good.id, good.chunkPos,
-                good.mode, good.algorithm, good.rawLength, good.xxh64, badPayload);
+                good.mode, good.rawLength, good.xxh64, badPayload);
         boolean rejected = false;
         try {
             ZPack.resolveEntry(bad, null);

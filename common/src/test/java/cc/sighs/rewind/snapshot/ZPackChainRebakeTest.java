@@ -124,11 +124,11 @@ class ZPackChainRebakeTest {
         // 中间墓碑 s11：链不断，s12 照解；文件不删
         assertTrue(cc.sighs.rewind.common.store.SnapshotStore.delete(worldRoot, "s11"));
         SnapshotIndex tomb = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
-        assertTrue(tomb.isTombstoned("s11"));
+        assertTrue(tomb.get("s11").tombstone);
         assertTrue(Files.isRegularFile(SnapshotLayout.zpackFile(worldRoot, "s11")));
         assertBranch(chain, tomb, expect, "s12");
         // 整树重烘焙：墓碑消失，s12 父拍平为 s10，全员逐字节一致
-        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot, null);
+        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot);
         assertEquals(13, result.liveSlots);
         assertEquals(1, result.droppedTombstones);
         SnapshotIndex after = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
@@ -175,7 +175,7 @@ class ZPackChainRebakeTest {
         }
         putIndex(metas.toArray(new SnapshotMeta[0]));
         long before = FullTreeRebakeWorker.directorySize(SnapshotLayout.snapshotRoot(worldRoot));
-        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot, null);
+        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot);
         assertEquals(nodes, result.liveSlots);
         assertEquals(0, result.droppedTombstones);
         long after = FullTreeRebakeWorker.directorySize(SnapshotLayout.snapshotRoot(worldRoot));
@@ -246,7 +246,7 @@ class ZPackChainRebakeTest {
         // 软删除：只写标记
         assertTrue(cc.sighs.rewind.common.store.SnapshotStore.delete(worldRoot, "quick"));
         SnapshotIndex after = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
-        assertTrue(after.isTombstoned("quick"));
+        assertTrue(after.get("quick").tombstone);
         assertTrue(Files.isRegularFile(SnapshotLayout.zpackFile(worldRoot, "quick")));
         // 链仍可解析（父子链不断）
         ZPackChain chain = new ZPackChain(SnapshotLayout.snapshotRoot(worldRoot));
@@ -255,7 +255,7 @@ class ZPackChainRebakeTest {
         assertFalse(cc.sighs.rewind.common.store.SnapshotStore.delete(worldRoot, "quick"));
         // 复活
         assertTrue(cc.sighs.rewind.common.store.SnapshotStore.restore(worldRoot, "quick"));
-        assertFalse(SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot)).isTombstoned("quick"));
+        assertFalse(SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot)).get("quick").tombstone);
     }
 
     @Test
@@ -361,7 +361,7 @@ class ZPackChainRebakeTest {
         byte[] wantS3 = beforeChain.resolveAll("s3", before).values().iterator().next();
         assertArrayEquals(v3, wantS3);
 
-        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot, null);
+        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot);
         assertEquals(2, result.liveSlots);
         assertEquals(1, result.droppedTombstones);
 
@@ -415,7 +415,7 @@ class ZPackChainRebakeTest {
         Files.write(SnapshotLayout.slotDir(worldRoot, "s2").resolve("junk.dat"), new byte[]{1});
         cc.sighs.rewind.common.store.SnapshotStore.delete(worldRoot, "s2");
 
-        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot, null);
+        FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(worldRoot);
         assertEquals(1, result.liveSlots);
         assertEquals(1, result.droppedTombstones);
 

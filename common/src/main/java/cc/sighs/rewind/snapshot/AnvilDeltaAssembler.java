@@ -6,6 +6,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import static cc.sighs.rewind.snapshot.AnvilFormat.CHUNK_COUNT;
+import static cc.sighs.rewind.snapshot.AnvilFormat.EXTERNAL_STREAM_FLAG;
+import static cc.sighs.rewind.snapshot.AnvilFormat.HEADER_BYTES;
+import static cc.sighs.rewind.snapshot.AnvilFormat.SECTOR_BYTES;
+import static cc.sighs.rewind.snapshot.AnvilFormat.getInt;
+import static cc.sighs.rewind.snapshot.AnvilFormat.putInt;
 
 /**
  * Anvil region 文件的内存组装器（纯 common / 纯 JDK）。
@@ -25,11 +31,6 @@ import java.util.Map;
  * {@link SnapshotChunkDecoder#mccRelative})。组装器只管 {@code .mca} 这边。
  */
 public final class AnvilDeltaAssembler {
-    public static final int SECTOR_BYTES = 4096;
-    public static final int HEADER_BYTES = 8192;
-    public static final int CHUNK_COUNT = 1024;
-    public static final int EXTERNAL_STREAM_FLAG = 128;
-
     private AnvilDeltaAssembler() {
     }
 
@@ -206,19 +207,5 @@ public final class AnvilDeltaAssembler {
         putInt(out, 0, 1);
         out[4] = (byte) (versionId | EXTERNAL_STREAM_FLAG);
         return out;
-    }
-
-    private static int getInt(byte[] bytes, int base) {
-        return ((bytes[base] & 0xFF) << 24)
-                | ((bytes[base + 1] & 0xFF) << 16)
-                | ((bytes[base + 2] & 0xFF) << 8)
-                | (bytes[base + 3] & 0xFF);
-    }
-
-    private static void putInt(byte[] bytes, int base, int value) {
-        bytes[base] = (byte) (value >> 24);
-        bytes[base + 1] = (byte) (value >> 16);
-        bytes[base + 2] = (byte) (value >> 8);
-        bytes[base + 3] = (byte) value;
     }
 }

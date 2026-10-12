@@ -231,6 +231,21 @@ class RealSaveFullReplayTest {
         public byte[] encodeRawNbt(Object tag) {
             return tag instanceof byte[] ? (byte[]) tag : null;
         }
+
+        @Override
+        public Object decodeChunkSector(byte[] uncompressed) {
+            return uncompressed;
+        }
+
+        @Override
+        public cc.sighs.rewind.common.spi.EncodedSector encodeChunkSector(Object tag) {
+            return null;
+        }
+
+        @Override
+        public String chunkDirRelative(cc.sighs.rewind.common.spi.StorageKind kind, String dimensionId) {
+            return null;
+        }
     }
 
     private static long timeWritePack(Path world, String slot, List<byte[]> raws) throws Exception {
@@ -363,7 +378,8 @@ class RealSaveFullReplayTest {
         SnapshotIndex loaded = SnapshotIndex.load(snapshots.resolve(SnapshotLayout.INDEX_FILE_NAME));
         ZPackChain chain = new ZPackChain(snapshots);
         chain.resolveAll("s2", loaded); // 预热
-        chain.clear();
+        // 换一个新链（不共享缓存），测冷解析
+        chain = new ZPackChain(snapshots);
         long start = System.nanoTime();
         java.util.Map<String, byte[]> resolved = chain.resolveAll("s2", loaded);
         long elapsedMs = (System.nanoTime() - start) / 1000000L;
@@ -412,7 +428,7 @@ class RealSaveFullReplayTest {
                 regions.put(region, chunks);
             }
             long key = (((long) x) << 32) | (z & 0xFFFFFFFFL);
-            chunks.put(key, new cc.sighs.rewind.snapshot.AnvilPacker.Chunk(x, z, raw, 2));
+            chunks.put(key, new cc.sighs.rewind.snapshot.AnvilPacker.Chunk(x, z, raw));
             expect.put(region + "#" + x + "#" + z, raw);
             i++;
         }
@@ -450,7 +466,8 @@ class RealSaveFullReplayTest {
                 int x = (int) (c.getKey() >> 32);
                 int z = (int) (long) c.getKey();
                 cc.sighs.rewind.snapshot.SnapshotChunkDecoder.Sector sector =
-                        cc.sighs.rewind.snapshot.SnapshotChunkDecoder.readSectorFromBytes(mca, x, z);
+                        cc.sighs.rewind.snapshot.SnapshotChunkDecoder.readSector(
+                                cc.sighs.rewind.snapshot.SnapshotChunkDecoder.SectorSource.ofBytes(mca), x, z);
                 assertTrue(sector != null && !sector.external, "chunk 应可读: " + x + "," + z);
                 assertArrayEquals(c.getValue().uncompressedNbt,
                         cc.sighs.rewind.snapshot.SnapshotChunkDecoder.decompress(

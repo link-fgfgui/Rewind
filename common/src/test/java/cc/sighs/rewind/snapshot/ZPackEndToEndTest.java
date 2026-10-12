@@ -103,6 +103,21 @@ class ZPackEndToEndTest {
         public byte[] encodeRawNbt(Object tag) {
             return tag instanceof byte[] ? (byte[]) tag : null;
         }
+
+        @Override
+        public Object decodeChunkSector(byte[] uncompressed) {
+            return uncompressed;
+        }
+
+        @Override
+        public cc.sighs.rewind.common.spi.EncodedSector encodeChunkSector(Object tag) {
+            return null;
+        }
+
+        @Override
+        public String chunkDirRelative(cc.sighs.rewind.common.spi.StorageKind kind, String dimensionId) {
+            return null;
+        }
     };
 
     private static long pos(int x, int z) {
@@ -202,7 +217,7 @@ class ZPackEndToEndTest {
         }
         // s1 软删除 → GC
         assertTrue(SnapshotStore.delete(worldRoot, "s1"));
-        FullTreeRebakeWorker.Result rebaked = FullTreeRebakeWorker.rebake(worldRoot, null);
+        FullTreeRebakeWorker.Result rebaked = FullTreeRebakeWorker.rebake(worldRoot);
         assertEquals(1, rebaked.liveSlots);
         assertEquals(1, rebaked.droppedTombstones);
         SnapshotIndex after = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
@@ -210,11 +225,11 @@ class ZPackEndToEndTest {
         assertEquals("", after.get("s2").parentSlot);
         assertFalse(Files.exists(SnapshotLayout.slotDir(worldRoot, "s1")));
         // 离线重建 s2：必须走纯 NBT 通路（此时 s2 有包，链完备）
-        SnapshotMirror.Result result = ZPackOffline.rebuild(worldRoot, "s2", LAYOUT);
-        assertNotNull(result, "GC 后应走纯 NBT 重建，而非回退");
+        ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, "s2", LAYOUT);
+        assertTrue(outcome.applied(), "GC 后应走纯 NBT 重建，而非回退: " + outcome.reason);
         Path mca = worldRoot.resolve("region/r.0.0.mca");
-        SnapshotChunkDecoder.Sector sector =
-                SnapshotChunkDecoder.readSectorFromBytes(Files.readAllBytes(mca), 3, 7);
+        SnapshotChunkDecoder.Sector sector = SnapshotChunkDecoder.readSector(
+                SnapshotChunkDecoder.SectorSource.ofBytes(Files.readAllBytes(mca)), 3, 7);
         assertNotNull(sector);
         assertArrayEquals(v2, SnapshotChunkDecoder.decompress(sector.versionId, sector.compressed));
         assertArrayEquals(score, gunzip(Files.readAllBytes(worldRoot.resolve("data/scoreboard.dat"))));

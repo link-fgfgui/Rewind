@@ -62,51 +62,44 @@ public interface RewindPlatform {
     /**
      * 把写账本里的不透明 NBT 句柄压缩成扇区负载（增量建点用）。
      *
-     * <p>默认返回 null（该平台还没接增量建点，建点回退到全量磁盘扫描）。
-     * 接入的版本用自己的 {@code NbtIo.write} + {@code RegionFileVersion} 实现，
+     * <p>接入的版本用自己的 {@code NbtIo.write} + {@code RegionFileVersion} 实现，
      * 压缩算法固定用 DEFLATE（解码器按头版本分派，重压成别的版本依然合法）。
      *
      * @param tag 写账本里存的那个句柄（版本侧的 {@code CompoundTag}）
+     * @return 未知句柄/编不出返回 null（调用方回退磁盘扫描，不当删除）
      */
-    default EncodedSector encodeChunkSector(Object tag) {
-        return null;
-    }
+    EncodedSector encodeChunkSector(Object tag);
 
     /**
      * 把解压后的 NBT 负载字节解成写账本能存的不透明句柄（回滚灌装用）。
      *
-     * <p>默认返回 null（该平台还没接内存直解，回滚回退到读活文件）。
-     * 接入的版本用自己的 {@code NbtIo.read} 实现。
+     * <p>接入的版本用自己的 {@code NbtIo.read} 实现。
      *
      * @param uncompressed 解码器解出来的未压缩 NBT 字节
+     * @return 解不出返回 null（调用方回退旧路，跳过该条目）
      */
-    default Object decodeChunkSector(byte[] uncompressed) {
-        return null;
-    }
+    Object decodeChunkSector(byte[] uncompressed);
 
     /**
      * 把写账本里的不透明 NBT 句柄编成未压缩 NBT 字节（zpack 字典差分建点用）。
      *
      * <p>与 {@link #decodeChunkSector} 互逆：本方法输出的字节交回去必须 round-trip 一致。
-     * 默认返回 null（该槽位不进 zpack，回滚走块存储旧路）。接入的版本用自己的
-     * {@code NbtIo.write}（不压缩，直出）实现。
+     * 接入的版本用自己的 {@code NbtIo.write}（不压缩，直出）实现。
      *
      * @param tag 写账本里存的那个句柄（版本侧的 {@code CompoundTag}）
-     * @return 未压缩 NBT 字节；编不出返回 null
+     * @return 未压缩 NBT 字节；未知句柄/编不出返回 null（该条目不进 zpack，回滚走块存储旧路）
      */
-    default byte[] encodeRawNbt(Object tag) {
-        return null;
-    }
+    byte[] encodeRawNbt(Object tag);
 
     /**
      * 增量建点时“(种类, 维度) → region 目录相对路径”的映射（如
      * {@code region}、{@code DIM-1/region}、{@code entities}……，相对世界根，
-     * {@code /} 分隔）。默认返回 null（未知布局，涉及该条目的文件回退到磁盘扫描；
-     * 1.20.1 模组自定义维度布局即走此分支，绝不硬猜）。
+     * {@code /} 分隔）。
+     *
+     * <p>未知布局返回 null（涉及该条目的文件回退到磁盘扫描；1.20.1 模组自定义维度布局
+     * 即走此分支，绝不硬猜）。
      */
-    default String chunkDirRelative(StorageKind kind, String dimensionId) {
-        return null;
-    }
+    String chunkDirRelative(StorageKind kind, String dimensionId);
 
     /**
      * 把账本里的打包坐标拆成 {@code {x, z}}（增量建点分组与 region 文件名用）。

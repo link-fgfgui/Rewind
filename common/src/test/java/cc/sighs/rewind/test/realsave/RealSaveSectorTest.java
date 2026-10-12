@@ -63,8 +63,8 @@ class RealSaveSectorTest {
         byte[] expected = slice("boundary_deflate_expected.nbt");
         int version = sector[4] & 0xFF;
         assertTrue(version == 2, "切片应为 DEFLATE 扇区，实际版本=" + version);
-        SnapshotChunkDecoder.Sector decoded =
-                SnapshotChunkDecoder.readSectorFromBytes(forgeMca(sector), CHUNK_X, CHUNK_Z);
+        SnapshotChunkDecoder.Sector decoded = SnapshotChunkDecoder.readSector(
+                SnapshotChunkDecoder.SectorSource.ofBytes(forgeMca(sector)), CHUNK_X, CHUNK_Z);
         assertNotNull(decoded);
         assertTrue(!decoded.external);
         assertArrayEquals(expected,
@@ -84,7 +84,8 @@ class RealSaveSectorTest {
         sector[3] = (byte) bad;
         boolean rejected = false;
         try {
-            SnapshotChunkDecoder.readSectorFromBytes(forgeMca(sector), CHUNK_X, CHUNK_Z);
+            SnapshotChunkDecoder.readSector(
+                    SnapshotChunkDecoder.SectorSource.ofBytes(forgeMca(sector)), CHUNK_X, CHUNK_Z);
         } catch (IOException expected) {
             rejected = true;
         }

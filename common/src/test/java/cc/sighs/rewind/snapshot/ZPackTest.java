@@ -60,10 +60,8 @@ class ZPackTest {
         }
         ZPack.Entry delta = ZPack.buildEntry(ZPack.TYPE_CHUNK, "minecraft:overworld", 99L,
                 target, base, false, ZstdDelta.DEFAULT_LEVEL);
-        // 小改动不应膨胀为 FULL（JNI 在场时）
-        if (ZstdDelta.isAvailable()) {
-            assertEquals(ZPack.MODE_DELTA, delta.mode);
-        }
+        // 小改动不应膨胀为 FULL
+        assertEquals(ZPack.MODE_DELTA, delta.mode);
         assertArrayEquals(target, ZPack.resolveEntry(delta, base));
     }
 
@@ -87,7 +85,7 @@ class ZPackTest {
         ZPack.Entry good = ZPack.buildEntry(ZPack.TYPE_DATA_FILE, "level.dat", 0L,
                 raw, null, true, ZstdDelta.DEFAULT_LEVEL);
         ZPack.Entry bad = new ZPack.Entry(good.targetType, good.id, good.chunkPos,
-                good.mode, good.algorithm, good.rawLength, good.xxh64 ^ 1L, good.payload);
+                good.mode, good.rawLength, good.xxh64 ^ 1L, good.payload);
         try {
             ZPack.resolveEntry(bad, null);
             throw new AssertionError("expected checksum failure");
@@ -140,47 +138,5 @@ class ZPackTest {
         writer.add(entry);
         ZPack.Entry back = ZPack.read(writer.toBytes()).entries.get(0);
         assertEquals(0, ZPack.resolveEntry(back, base).length);
-    }
-
-    /** Deflate 兜底压缩（模拟 JNI 缺席环境的 ZstdDelta.deflate 输出）。 */
-    private static byte[] deflate(byte[] raw) throws Exception {
-        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(raw.length / 2 + 32);
-        try (java.util.zip.DeflaterOutputStream out =
-                     new java.util.zip.DeflaterOutputStream(bos, new java.util.zip.Deflater(3))) {
-            out.write(raw);
-        }
-        return bos.toByteArray();
-    }
-
-    @Test
-    void deflateFallbackPayloadIsSelfDescribed() throws Exception {
-        // TODO2-FIX #7：无 JNI 环境写入的 Deflate 载荷必须在格式内自描述（模式字节高位 0x80），
-        // 拷到有 JNI 环境打开时不得被当成 Zstd 帧硬解。
-        byte[] raw = nbt(4096, 42);
-        ZPack.Writer writer = new ZPack.Writer();
-        // FULL：无字典 Deflate
-        writer.add(new ZPack.Entry(ZPack.TYPE_CHUNK, "dim", 7L, ZPack.MODE_FULL,
-                ZPack.ALGO_DEFLATE, raw.length, Xxh64.hash(raw), deflate(raw)));
-        // DELTA：兜底 Deflate 也无字典概念，载荷同样是独立压缩的 target
-        byte[] base = nbt(4096, 43);
-        writer.add(new ZPack.Entry(ZPack.TYPE_CHUNK, "dim", 8L, ZPack.MODE_DELTA,
-                ZPack.ALGO_DEFLATE, raw.length, Xxh64.hash(raw), deflate(raw)));
-        ZPack.Packed packed = ZPack.read(writer.toBytes());
-        ZPack.Entry full = packed.entries.get(0);
-        ZPack.Entry delta = packed.entries.get(1);
-        assertEquals(ZPack.ALGO_DEFLATE, full.algorithm);
-        assertEquals(ZPack.MODE_FULL, full.mode);
-        assertEquals(ZPack.MODE_DELTA, delta.mode, "高位标志不得污染模式");
-        assertEquals(ZPack.ALGO_DEFLATE, delta.algorithm);
-        assertArrayEquals(raw, ZPack.resolveEntry(full, null));
-        assertArrayEquals(raw, ZPack.resolveEntry(delta, base));
-        // Zstd 载荷照旧默认 ALGO_ZSTD（JNI 在场时）
-        if (ZstdDelta.isAvailable()) {
-            ZPack.Entry zstd = ZPack.buildEntry(ZPack.TYPE_CHUNK, "dim", 9L, raw, null, true, 3);
-            assertEquals(ZPack.ALGO_ZSTD, zstd.algorithm);
-            ZPack.Writer writer2 = new ZPack.Writer();
-            writer2.add(zstd);
-            assertEquals(ZPack.ALGO_ZSTD, ZPack.read(writer2.toBytes()).entries.get(0).algorithm);
-        }
     }
 }

@@ -93,6 +93,16 @@ class ZPackCheckpointTest {
         public Object decodeChunkSector(byte[] uncompressed) {
             return uncompressed;
         }
+
+        @Override
+        public cc.sighs.rewind.common.spi.EncodedSector encodeChunkSector(Object tag) {
+            return null;
+        }
+
+        @Override
+        public String chunkDirRelative(StorageKind kind, String dimensionId) {
+            return null;
+        }
     }
 
     private static byte[] nbt(int size, int seed) {
@@ -197,10 +207,36 @@ class ZPackCheckpointTest {
         // 子包应对同名项存 DELTA（小改动不膨胀）
         ZPack.Packed child = ZPack.read(Files.readAllBytes(SnapshotLayout.zpackFile(worldRoot, "s2")));
         assertEquals(1, child.entries.size());
-        if (ZstdDelta.isAvailable()) {
-            assertEquals(ZPack.MODE_DELTA, child.entries.get(0).mode);
-        }
+        assertEquals(ZPack.MODE_DELTA, child.entries.get(0).mode);
         Map<String, byte[]> resolved = ZPackCheckpoint.tryResolve(worldRoot, "s2");
+        assertArrayEquals(v2, resolved.get(ZPack.keyOf(ZPack.TYPE_CHUNK, "dim", 5L)));
+    }
+
+    @Test
+    void quickSlotIsAlwaysFullEvenWithParent() throws Exception {
+        // TODO-ZSTD §3：F7 的 quick 槽位「只压缩、不 diff」。即使挂了父槽位、内容只有微改，
+        // 也必须是 MODE_FULL（建点不物化父链；回滚解算链深度恒为 0）。
+        putIndexHere("s1", "");
+        putIndexHere("quick", "s1");
+        byte[] v1 = nbt(40 * 1024, 91);
+        byte[] v2 = v1.clone();
+        for (int i = 900; i < 940; i++) {
+            v2[i] ^= 0x21;
+        }
+        StorageOverlay j1 = new StorageOverlay();
+        j1.onWritten(StorageKind.CHUNK, "dim", 5L, v1);
+        ZPackCheckpoint.writeSlotZpack(worldRoot, "s1", "", j1.entries(),
+                Collections.<String>emptyList(), SnapshotLayout.slotDir(worldRoot, "s1"),
+                new IdentityPlatform());
+        StorageOverlay j2 = new StorageOverlay();
+        j2.onWritten(StorageKind.CHUNK, "dim", 5L, v2);
+        ZPackCheckpoint.writeSlotZpack(worldRoot, "quick", "s1", j2.entries(),
+                Collections.<String>emptyList(), SnapshotLayout.slotDir(worldRoot, "quick"),
+                new IdentityPlatform());
+        ZPack.Packed quick = ZPack.read(Files.readAllBytes(SnapshotLayout.zpackFile(worldRoot, "quick")));
+        assertEquals(1, quick.entries.size());
+        assertEquals(ZPack.MODE_FULL, quick.entries.get(0).mode, "quick 必须只压缩、不 diff");
+        Map<String, byte[]> resolved = ZPackCheckpoint.tryResolve(worldRoot, "quick");
         assertArrayEquals(v2, resolved.get(ZPack.keyOf(ZPack.TYPE_CHUNK, "dim", 5L)));
     }
 

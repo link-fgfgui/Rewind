@@ -252,7 +252,7 @@ class SnapshotMirrorTest {
         prepare();
         write(world.resolve(SnapshotLayout.ROOT_DIR_NAME + "/stranded"), "x", 1_000L);
         write(world.resolve("session.lock"), "lock", 1_000L);
-        write(world.resolve("region/r.0.0.mca" + SnapshotMirror.TEMP_SUFFIX), "half", 1_000L);
+        write(world.resolve("region/r.0.0.mca" + AtomicFiles.TEMP_SUFFIX), "half", 1_000L);
         write(world.resolve("region/r.0.0.mca"), "real", 1_000L);
         SnapshotBlocks map = SnapshotBlocks.empty();
 

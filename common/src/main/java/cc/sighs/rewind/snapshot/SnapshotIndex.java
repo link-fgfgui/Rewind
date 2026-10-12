@@ -5,7 +5,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -19,6 +18,13 @@ public final class SnapshotIndex {
     private static final String HEAD_KEY = "head";
     /** 上一次成功回溯的时刻（毫秒）；读档冷却用它算剩余时间。 */
     private static final String LAST_ROLLBACK_KEY = "lastRollbackAt";
+    /**
+     * 顺 {@code parentSlot} 走时间线的步数上限（环保护）。
+     *
+     * <p>正常时间线不可能成环（建点/重烘焙都会断环），这里只是防手改索引后死循环；
+     * 全仓的时间线遍历（链解析、深度统计、祖先查找）共用这一个上限。
+     */
+    public static final int TIMELINE_WALK_LIMIT = 256;
 
     private final Properties properties = new Properties();
 
@@ -135,29 +141,6 @@ public final class SnapshotIndex {
     }
 
     /**
-     * 该槽位是否为墓碑（游戏内软删除，仅标记隐藏）。
-     */
-    public boolean isTombstoned(String slot) {
-        SnapshotMeta meta = get(slot);
-        return meta != null && meta.tombstone;
-    }
-
-    /**
-     * 设置/清除墓碑标记（只改内存，落盘由 {@link #save(Path)} 负责）。
-     *
-     * @return 槽位是否存在
-     */
-    public boolean setTombstone(String slot, boolean tombstone) {
-        SnapshotMeta meta = get(slot);
-        if (meta == null) {
-            return false;
-        }
-        meta.tombstone = tombstone;
-        put(meta, slot);
-        return true;
-    }
-
-    /**
      * 时间线的「头」：世界当前站在哪个存档点上（槽位名）。
      *
      * <p>建点时新节点就挂在它下面，回滚到某个存档点之后就移到那个槽位。空表示还不知道
@@ -205,11 +188,7 @@ public final class SnapshotIndex {
         try (OutputStream out = Files.newOutputStream(temp)) {
             properties.store(out, "Rewind snapshot index");
         }
-        try {
-            Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException atomicUnsupported) {
-            Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING);
-        }
+        AtomicFiles.commit(temp, file);
     }
 
     private String key(String slot, String field) {

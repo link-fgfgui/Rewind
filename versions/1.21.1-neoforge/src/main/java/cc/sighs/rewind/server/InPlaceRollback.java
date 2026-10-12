@@ -545,22 +545,19 @@ public final class InPlaceRollback {
         }
         String mcaRelative = SnapshotLayout.normalize(dir + "/" + regionFileName(pos));
         try {
-            SnapshotChunkDecoder.Sector sector;
-            byte[] externalPayload = null;
             SnapshotBlocks.Entry entry = blocks.get(mcaRelative);
-            if (entry != null) {
-                sector = SnapshotChunkDecoder.readSector(store, blocks, mcaRelative, pos.x, pos.z);
-                if (sector != null && sector.external) {
-                    String mccRelative = SnapshotChunkDecoder.mccRelative(mcaRelative, pos.x, pos.z);
-                    externalPayload = SnapshotChunkDecoder.readExternalPayload(store, blocks, mccRelative);
-                }
-            } else {
-                Path slotFile = slotDir.resolve(mcaRelative);
-                sector = SnapshotChunkDecoder.readSectorFromFile(slotFile, pos.x, pos.z);
-                if (sector != null && sector.external) {
-                    Path slotMcc = slotDir.resolve(SnapshotChunkDecoder.mccRelative(mcaRelative, pos.x, pos.z));
-                    externalPayload = SnapshotChunkDecoder.readExternalPayloadFromFile(slotMcc);
-                }
+            SnapshotChunkDecoder.SectorSource source = entry != null
+                    ? SnapshotChunkDecoder.SectorSource.ofBlocks(store, entry)
+                    : SnapshotChunkDecoder.SectorSource.ofFile(slotDir.resolve(mcaRelative));
+            SnapshotChunkDecoder.Sector sector = SnapshotChunkDecoder.readSector(source, pos.x, pos.z);
+            byte[] externalPayload = null;
+            if (sector != null && sector.external) {
+                String mccRelative = SnapshotChunkDecoder.mccRelative(mcaRelative, pos.x, pos.z);
+                // 块映射来的 .mca，其外溢载荷必须也在块映射里（缺席即损坏，不换源猜）
+                SnapshotChunkDecoder.SectorSource mccSource = entry != null
+                        ? SnapshotChunkDecoder.SectorSource.ofBlocks(store, blocks.get(mccRelative))
+                        : SnapshotChunkDecoder.SectorSource.ofFile(slotDir.resolve(mccRelative));
+                externalPayload = SnapshotChunkDecoder.readExternalPayload(mccSource);
             }
             if (sector == null) {
                 // 快照里没有这个区块：记删除标记，读拦截短路喂空

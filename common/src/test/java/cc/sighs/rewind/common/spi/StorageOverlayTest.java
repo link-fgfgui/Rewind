@@ -25,7 +25,7 @@ class StorageOverlayTest {
         Object tag = new Object();
         overlay.onWritten(StorageKind.CHUNK, "minecraft:overworld", POS, tag);
         assertSame(tag, overlay.serve(StorageKind.CHUNK, "minecraft:overworld", POS));
-        assertEquals(1, overlay.size());
+        assertEquals(1, overlay.entries().size());
     }
 
     @Test
@@ -43,7 +43,7 @@ class StorageOverlayTest {
         overlay.onWritten(StorageKind.ENTITY, "minecraft:overworld", POS, first);
         overlay.onWritten(StorageKind.ENTITY, "minecraft:overworld", POS, second);
         assertSame(second, overlay.serve(StorageKind.ENTITY, "minecraft:overworld", POS));
-        assertEquals(1, overlay.size());
+        assertEquals(1, overlay.entries().size());
     }
 
     @Test
@@ -58,16 +58,7 @@ class StorageOverlayTest {
         assertSame(chunk, overlay.serve(StorageKind.CHUNK, "minecraft:overworld", POS));
         assertSame(entity, overlay.serve(StorageKind.ENTITY, "minecraft:overworld", POS));
         assertSame(nether, overlay.serve(StorageKind.CHUNK, "minecraft:the_nether", POS));
-        assertEquals(3, overlay.size());
-    }
-
-    @Test
-    void discardRemoves() {
-        StorageOverlay overlay = new StorageOverlay();
-        overlay.onWritten(StorageKind.POI, "minecraft:overworld", POS, new Object());
-        assertTrue(overlay.discard(StorageKind.POI, "minecraft:overworld", POS));
-        assertNull(overlay.serve(StorageKind.POI, "minecraft:overworld", POS));
-        assertFalse(overlay.discard(StorageKind.POI, "minecraft:overworld", POS));
+        assertEquals(3, overlay.entries().size());
     }
 
     @Test
@@ -76,7 +67,7 @@ class StorageOverlayTest {
         overlay.onWritten(StorageKind.CHUNK, "minecraft:overworld", POS, new Object());
         overlay.onWritten(StorageKind.ENTITY, "minecraft:overworld", POS, new Object());
         overlay.clear();
-        assertEquals(0, overlay.size());
+        assertEquals(0, overlay.entries().size());
         assertNull(overlay.serve(StorageKind.CHUNK, "minecraft:overworld", POS));
     }
 
@@ -86,7 +77,7 @@ class StorageOverlayTest {
         overlay.onWritten(StorageKind.CHUNK, "minecraft:overworld", POS, null);
         assertTrue(overlay.covers(StorageKind.CHUNK, "minecraft:overworld", POS));
         assertNull(overlay.serve(StorageKind.CHUNK, "minecraft:overworld", POS));
-        assertEquals(1, overlay.size());
+        assertEquals(1, overlay.entries().size());
         assertEquals(0, overlay.serveHits());
         assertFalse(overlay.covers(StorageKind.ENTITY, "minecraft:overworld", POS));
     }
@@ -101,8 +92,6 @@ class StorageOverlayTest {
                 () -> overlay.onWritten(StorageKind.CHUNK, null, POS, tag));
         assertThrows(NullPointerException.class,
                 () -> overlay.serve(null, "minecraft:overworld", POS));
-        assertThrows(NullPointerException.class,
-                () -> overlay.discard(StorageKind.CHUNK, null, POS));
     }
 
     @Test

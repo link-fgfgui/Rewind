@@ -5,7 +5,6 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -13,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
+import cc.sighs.rewind.common.config.RollbackSettings;
 import cc.sighs.rewind.common.spi.RewindPlatform;
 import cc.sighs.rewind.common.spi.StorageKind;
 import cc.sighs.rewind.common.spi.StorageOverlay;
@@ -24,8 +24,9 @@ import cc.sighs.rewind.common.spi.StorageOverlay;
  * {@code <slot>.zpack}。附加式写入：失败只记日志，块存储仍是权威源，回滚自动退回旧路。
  *
  * <p>读（回滚）：{@link #tryResolve} 一次解出目标槽位的全量 key→raw 表。
- * 命中即快路；未命中（链上有洞、老槽位无包、建点时编不出）一律回退块存储旧路——
- * 调用方不得把“zpack 里没有”当成删除。
+ * 命中即快路；未命中（老槽位无包、建点时编不出）一律回退块存储旧路——调用方不得把
+ * “zpack 里没有”当成删除。链上缺包（洞）直接抛 {@link IOException}：键丢失与从未
+ * 写过必须可区分（见 {@link ZPackChain}）。
  *
  * <p>raw 规定：未压缩 NBT 字节（{@code NbtIo.write} 直出）。空数组表示删除标记
  * （账本 null tag 对应），调用方喂覆盖层时转回 null。
@@ -117,10 +118,13 @@ public final class ZPackCheckpoint {
             throw new IOException("no platform for zpack encode");
         }
         SnapshotIndex index = SnapshotIndex.load(SnapshotLayout.indexFile(worldRoot));
+        // F7 的 quick 槽位「只压缩、不 diff」（TODO-ZSTD §3）：闪回场景要的是建点低延迟，
+        // 不物化父链、不算关键帧深度，全部条目直接 FULL（体积由滚动特性兜住：只留一个）。
+        boolean noDelta = SnapshotLayout.SLOT_QUICK.equals(slot);
         // 父槽位全量 raw（无父/父无包/链损坏 → 空表，本包全 FULL，天然兜底）
         Map<String, byte[]> parentRaw = new HashMap<>();
         ZPackChain chain = new ZPackChain(SnapshotLayout.snapshotRoot(worldRoot));
-        if (parentSlot != null && !parentSlot.isEmpty()) {
+        if (!noDelta && parentSlot != null && !parentSlot.isEmpty()) {
             try {
                 parentRaw = chain.resolveAll(parentSlot, index);
             } catch (Throwable t) {
@@ -150,9 +154,9 @@ public final class ZPackCheckpoint {
                     }
                 }
                 byte[] dict = parentRaw.get(key);
-                boolean forceFull = dict == null || needsKeyframe(chain, parentSlot, key, index);
+                boolean forceFull = noDelta || dict == null || needsKeyframe(chain, parentSlot, key, index);
                 writer.add(ZPack.buildEntry(type, e.dimensionId, e.chunkPos,
-                        raw, dict, forceFull, ZstdDelta.DEFAULT_LEVEL));
+                        raw, dict, forceFull, RollbackSettings.zstdLevel()));
             }
         }
         if (slotFiles != null && slotDir != null) {
@@ -172,9 +176,9 @@ public final class ZPackCheckpoint {
                 }
                 String key = ZPack.keyOf(ZPack.TYPE_DATA_FILE, relative, 0L);
                 byte[] dict = parentRaw.get(key);
-                boolean forceFull = dict == null || needsKeyframe(chain, parentSlot, key, index);
+                boolean forceFull = noDelta || dict == null || needsKeyframe(chain, parentSlot, key, index);
                 writer.add(ZPack.buildEntry(ZPack.TYPE_DATA_FILE, relative, 0L,
-                        raw, dict, forceFull, ZstdDelta.DEFAULT_LEVEL));
+                        raw, dict, forceFull, RollbackSettings.zstdLevel()));
             }
         }
         byte[] bytes = writer.toBytes();
@@ -183,19 +187,7 @@ public final class ZPackCheckpoint {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        Path tmp = target.resolveSibling(target.getFileName().toString() + ".rewind-tmp");
-        try {
-            Files.write(tmp, bytes);
-            try {
-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
-            } catch (IOException atomicUnsupported) {
-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } catch (IOException | RuntimeException e) {
-            Files.deleteIfExists(tmp);
-            throw e;
-        }
+        AtomicFiles.write(target, bytes);
         return new Written(writer.size(), writer.payloadBytes());
     }
 

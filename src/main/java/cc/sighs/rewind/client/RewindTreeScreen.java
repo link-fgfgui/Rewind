@@ -492,7 +492,7 @@ public final class RewindTreeScreen extends ApricityScreen {
             return;
         }
         SnapshotMeta meta = RewindApi.describe(worldRoot(), slot);
-        if (meta == null || !meta.isComplete()) {
+        if (!isRestorable(meta)) {
             log("rewind.ui.log.no_snapshot");
             return;
         }
@@ -1504,7 +1504,7 @@ public final class RewindTreeScreen extends ApricityScreen {
         html.append(row("rewind.ui.detail.save_size", sizeText(meta.totalBytes)));
         html.append("</ul>");
         html.append("<div class=\"detail-actions\">");
-        html.append(actionButton(selectedSlot, "load", "button-secondary", tr("rewind.ui.action.load_full"), !meta.isComplete()));
+        html.append(actionButton(selectedSlot, "load", "button-secondary", tr("rewind.ui.action.load_full"), !isRestorable(meta)));
         html.append(actionButton(selectedSlot, "save", "", tr("rewind.ui.action.save_full"), false));
         html.append(actionButton(selectedSlot, "rename", "button-tertiary", tr("rewind.ui.action.rename"), false));
         html.append(actionButton(selectedSlot, "delete", "button-danger", tr("rewind.ui.action.delete"), false));
@@ -1793,7 +1793,7 @@ public final class RewindTreeScreen extends ApricityScreen {
     }
 
     private static boolean isRestorable(@Nullable SnapshotMeta meta) {
-        return meta != null && meta.isComplete();
+        return meta != null && meta.isRestorable();
     }
 
     /** 最新写入的手动槽位时间戳；只有手动卡片会挂 {@code newest-flag}，所以特殊槽位不参与。 */

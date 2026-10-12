@@ -9,11 +9,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * ZPack 链式解析：沿时间树父子边从最近 FULL 关键帧向前重放（TODO2 §3.2）。
+ * ZPack 链式解析：沿时间树父子边从根向下重放（TODO2 §3.2）。
  *
  * <p>每个槽位的 {@code <slot>.zpack} 记录相对其 {@code parentSlot} 的差分。
- * 解析目标槽位 S 时：顺 parent 链向上收集 zpack，直到遇到对目标 key 为 FULL
- * 的槽位（或链根），再自顶向下逐项 {@link ZPack#resolveEntry} 重放。
+ * 解析目标槽位 S 时：顺 parent 链向上收集到根，再自顶向下逐项 {@link ZPack#resolveEntry}
+ * 重放。链上任何一环缺包即抛 {@link IOException}——「key 从没被写过」与「包丢了」
+ * 必须可区分，绝不产出静默残缺的表（调用方按损坏回退旧路）。
  * 中间态经 LRU 缓存，避免深度 N 时间树产生 O(N) 解压雪崩；关键帧上限
  * {@link ZPack#KEYFRAME_CHAIN_LIMIT}（K≤20）保证最坏重放长度有界。
  *
@@ -42,10 +43,6 @@ public final class ZPackChain {
         this.snapshotRoot = snapshotRoot;
     }
 
-    public ZPackChain(Path worldRoot, boolean isWorldRoot) {
-        this.snapshotRoot = isWorldRoot ? SnapshotLayout.snapshotRoot(worldRoot) : worldRoot;
-    }
-
     /**
      * 解析目标槽位全部 Entry（key → 未压缩 NBT）。
      *
@@ -60,6 +57,11 @@ public final class ZPackChain {
         for (int i = chain.size() - 1; i >= 0; i--) {
             String slot = chain.get(i);
             ZPack.Packed packed = loadPack(slot);
+            if (packed == null) {
+                // 缺包一环：不能把「链里没有」当成「没写过」，显式按损坏处理
+                throw new IOException("zpack chain hole: slot " + slot
+                        + " has no pack while resolving " + targetSlot);
+            }
             packs.add(packed);
             slots.add(slot);
         }
@@ -67,9 +69,6 @@ public final class ZPackChain {
         for (int i = 0; i < packs.size(); i++) {
             String slot = slots.get(i);
             ZPack.Packed packed = packs.get(i);
-            if (packed == null) {
-                continue;
-            }
             for (ZPack.Entry entry : packed.entries) {
                 String key = entry.key();
                 // LRU 命中直接复用已解析的同槽位同 key：中间祖先槽位同样可短路重放
@@ -97,14 +96,6 @@ public final class ZPackChain {
     }
 
     /**
-     * 解析单个 key 在目标槽位的值；不存在返回 null。
-     */
-    public byte[] resolveOne(String targetSlot, SnapshotIndex index, String key) throws IOException {
-        Map<String, byte[]> all = resolveAll(targetSlot, index);
-        return all.get(key);
-    }
-
-    /**
      * 计算自上一 FULL 以来的链深（用于建点时关键帧判定）。
      *
      * @param slot  新槽位的父槽位（从它向上数）
@@ -116,7 +107,7 @@ public final class ZPackChain {
         int depth = 0;
         String current = slot;
         int steps = 0;
-        while (current != null && !current.isEmpty() && steps++ < 128) {
+        while (current != null && !current.isEmpty() && steps++ < SnapshotIndex.TIMELINE_WALK_LIMIT) {
             ZPack.Packed packed = loadPack(current);
             if (packed == null) {
                 return depth;
@@ -152,7 +143,7 @@ public final class ZPackChain {
         List<String> chain = new ArrayList<>();
         String current = targetSlot;
         int steps = 0;
-        while (current != null && !current.isEmpty() && steps++ < 256) {
+        while (current != null && !current.isEmpty() && steps++ < SnapshotIndex.TIMELINE_WALK_LIMIT) {
             chain.add(current);
             SnapshotMeta meta = index.get(current);
             if (meta == null || meta.parentSlot == null || meta.parentSlot.isEmpty()) {
@@ -190,11 +181,5 @@ public final class ZPackChain {
 
     private synchronized void putCache(String slot, String key, byte[] raw) {
         cache.put(slot + "\0" + key, raw);
-    }
-
-    /** 清空 LRU 与 pack 缓存（世界卸载时调用，防跨世界串键）。 */
-    public synchronized void clear() {
-        cache.clear();
-        packCache.clear();
     }
 }

@@ -11,7 +11,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -61,8 +60,6 @@ public final class SnapshotBlockStore implements Closeable {
     private static final String PACK_FILE = "pack";
     private static final String INDEX_FILE = "index";
     private static final String INDEX_HEADER = "#rewind-blocks 1 ";
-    /** 写文件时用的临时后缀（{@code SnapshotLayout.isExcluded} 会排除它）。 */
-    private static final String TEMP_SUFFIX = ".rewind-tmp";
     /**
      * 整包缓存的上限：重建一份 .mca 要读上千个块，这些块散在几百个分片里，每块一次随机读的代价
      * 按块数走。存储整体装得下就改成整包顺序读；装不下就退回随机读。
@@ -169,14 +166,7 @@ public final class SnapshotBlockStore implements Closeable {
             int read;
             while ((read = readFully(in, buffer)) > 0) {
                 // 必须复制：buffer 会被下一轮覆盖，而这些块要留到 close() 才写
-                byte[] block = Arrays.copyOf(buffer, read);
-                String hash = hex(digest.digest(block));
-                hashes.add(hash);
-                if (contains(hash)) {
-                    continue;
-                }
-                pending.computeIfAbsent(shardOf(hash), key -> new LinkedHashMap<>()).put(hash, block);
-                newBytes += read;
+                newBytes += ingestBlock(Arrays.copyOf(buffer, read), digest, hashes);
             }
         }
         return new Stored(hashes, newBytes);
@@ -199,16 +189,25 @@ public final class SnapshotBlockStore implements Closeable {
         // 空文件：不收任何块，调用方按 size=0 重建出空文件
         while (offset < data.length) {
             int length = Math.min(BLOCK_SIZE, data.length - offset);
-            byte[] block = Arrays.copyOfRange(data, offset, offset + length);
-            String hash = hex(digest.digest(block));
-            hashes.add(hash);
-            if (!contains(hash)) {
-                pending.computeIfAbsent(shardOf(hash), key -> new LinkedHashMap<>()).put(hash, block);
-                newBytes += length;
-            }
+            newBytes += ingestBlock(Arrays.copyOfRange(data, offset, offset + length), digest, hashes);
             offset += length;
         }
         return new Stored(hashes, newBytes);
+    }
+
+    /**
+     * 收一个已切好的 4 KiB 块：算哈希、记入序列、新块计入待落盘集合。
+     *
+     * @return 真正新写盘的字节数（存储里已有的块返回 0）
+     */
+    private long ingestBlock(byte[] block, MessageDigest digest, List<String> hashes) {
+        String hash = hex(digest.digest(block));
+        hashes.add(hash);
+        if (contains(hash)) {
+            return 0L;
+        }
+        pending.computeIfAbsent(shardOf(hash), key -> new LinkedHashMap<>()).put(hash, block);
+        return block.length;
     }
 
     /**
@@ -231,7 +230,7 @@ public final class SnapshotBlockStore implements Closeable {
             throw new IOException("block list is empty but size is " + size);
         }
         byte[] out = new byte[(int) size];
-        readRangeInto(hashes, size, 0, out, 0, (int) size);
+        readRangeInto(hashes, 0, out, 0, (int) size);
         return out;
     }
 
@@ -251,7 +250,7 @@ public final class SnapshotBlockStore implements Closeable {
             throw new EOFException("range [" + offset + ", " + (offset + length) + ") exceeds file size " + fileSize);
         }
         byte[] out = new byte[length];
-        readRangeInto(hashes, fileSize, offset, out, 0, length);
+        readRangeInto(hashes, offset, out, 0, length);
         return out;
     }
 
@@ -354,7 +353,7 @@ public final class SnapshotBlockStore implements Closeable {
 
     /** 目标不存在或大小不同：写临时文件再原子替换。 */
     private void writeFresh(List<String> hashes, long size, Path target) throws IOException {
-        Path temp = target.resolveSibling(target.getFileName().toString() + TEMP_SUFFIX);
+        Path temp = AtomicFiles.tempFor(target);
         try {
             try (OutputStream out = Files.newOutputStream(temp)) {
                 byte[] buffer = new byte[BLOCK_SIZE];
@@ -369,11 +368,11 @@ public final class SnapshotBlockStore implements Closeable {
             if (written != size) {
                 throw new IOException("rebuilt " + target + " is " + written + " bytes, expected " + size);
             }
-            moveAtomic(temp, target);
         } catch (IOException | RuntimeException e) {
             Files.deleteIfExists(temp);
             throw e;
         }
+        AtomicFiles.commit(temp, target);
     }
 
     private static boolean sameBytes(byte[] left, byte[] right, int length) {
@@ -409,7 +408,7 @@ public final class SnapshotBlockStore implements Closeable {
      * <p>块按 {@link #BLOCK_SIZE} 顺序拼接（最后一块可能不足一块），按文件偏移换算到块号，
      * 只读区间覆盖到的块。调用方保证区间不越界（越界抛 {@link EOFException} 由上层按损坏处理）。
      */
-    private void readRangeInto(List<String> hashes, long fileSize, long fileOffset,
+    private void readRangeInto(List<String> hashes, long fileOffset,
             byte[] out, int destOffset, int length) throws IOException {
         if (length == 0) {
             return;
@@ -676,10 +675,8 @@ public final class SnapshotBlockStore implements Closeable {
                 offset += length;
             }
         }
-        Path newIndex = shardDir.resolve(INDEX_FILE + TEMP_SUFFIX);
-        Files.write(newIndex, lines.toString().getBytes(StandardCharsets.UTF_8));
         // 一次原子替换就完成了切换：index 里记着它配的是哪个 pack
-        moveAtomic(newIndex, shardDir.resolve(INDEX_FILE));
+        AtomicFiles.write(shardDir.resolve(INDEX_FILE), lines.toString().getBytes(StandardCharsets.UTF_8));
         // 旧的 pack 现在没人引用了，顺手删掉（删不掉也只是占点空间，下次压缩再试）
         try {
             Files.deleteIfExists(shardDir.resolve(shard.packName));
@@ -717,13 +714,5 @@ public final class SnapshotBlockStore implements Closeable {
             total += read;
         }
         return total;
-    }
-
-    private static void moveAtomic(Path temp, Path target) throws IOException {
-        try {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException atomicUnsupported) {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-        }
     }
 }

@@ -1,5 +1,8 @@
 package cc.sighs.rewind.snapshot;
 
+import java.io.IOException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -269,5 +272,36 @@ public final class SnapshotLayout {
             return true;
         }
         return false;
+    }
+
+    /**
+     * 自底向上删掉 root 下的空目录（root 自身与 {@link #isExcluded} 命中的路径不动）。
+     *
+     * <p>镜像/重建/建点镜像都靠它收拾文件被删后留下的空壳目录；删不掉（非空、被占用）
+     * 就留着，不影响正确性。
+     */
+    public static void pruneEmptyDirectories(Path root) throws IOException {
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<Path>() {
+            @Override
+            public java.nio.file.FileVisitResult postVisitDirectory(Path dir, IOException exc) {
+                if (dir.equals(root)) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+                if (isExcluded(relativize(root, dir))) {
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+                    if (!stream.iterator().hasNext()) {
+                        Files.deleteIfExists(dir);
+                    }
+                } catch (IOException ignored) {
+                    // 目录非空或被占用：留着即可
+                }
+                return java.nio.file.FileVisitResult.CONTINUE;
+            }
+        });
     }
 }

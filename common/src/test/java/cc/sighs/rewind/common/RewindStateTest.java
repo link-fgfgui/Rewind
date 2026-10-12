@@ -42,11 +42,11 @@ class RewindStateTest {
     @Test
     void disarmClearsJournal() {
         RewindState.storageJournal().onWritten(StorageKind.CHUNK, "minecraft:overworld", POS, new Object());
-        assertEquals(1, RewindState.storageJournal().size());
+        assertEquals(1, RewindState.storageJournal().entries().size());
         RewindState.armStorageCover();
         RewindState.disarmStorageCover();
         assertFalse(RewindState.isStorageCoverArmed());
-        assertEquals(0, RewindState.storageJournal().size());
+        assertEquals(0, RewindState.storageJournal().entries().size());
         assertNull(RewindState.storageJournal().serve(StorageKind.CHUNK, "minecraft:overworld", POS));
     }
 
@@ -56,7 +56,7 @@ class RewindStateTest {
         RewindState.storageJournal().onWritten(StorageKind.ENTITY, "minecraft:overworld", POS, new Object());
         RewindState.clearStorageJournal();
         assertTrue(RewindState.isStorageCoverArmed());
-        assertEquals(0, RewindState.storageJournal().size());
+        assertEquals(0, RewindState.storageJournal().entries().size());
     }
 
     @Test
@@ -68,18 +68,18 @@ class RewindStateTest {
     @Test
     void disarmClearsDataCover() {
         RewindState.dataCover().onWritten("player|uuid", new Object());
-        assertEquals(1, RewindState.dataCover().size());
+        assertTrue(RewindState.dataCover().covers("player|uuid"));
         RewindState.armStorageCover();
         RewindState.disarmStorageCover();
-        assertEquals(0, RewindState.dataCover().size());
+        assertFalse(RewindState.dataCover().covers("player|uuid"));
     }
 
     @Test
     void recordChunkWriteRegistersJournal() {
         RewindState.recordChunkWrite(StorageKind.CHUNK, "minecraft:overworld", POS, new Object());
-        assertEquals(1, RewindState.storageJournal().size());
+        assertEquals(1, RewindState.storageJournal().entries().size());
         RewindState.clearStorageJournal();
-        assertEquals(0, RewindState.storageJournal().size());
+        assertEquals(0, RewindState.storageJournal().entries().size());
     }
 
     @TempDir
@@ -145,6 +145,26 @@ class RewindStateTest {
 
             @Override
             public ClassLoader modClassLoader(String modId) {
+                return null;
+            }
+
+            @Override
+            public cc.sighs.rewind.common.spi.EncodedSector encodeChunkSector(Object tag) {
+                return null;
+            }
+
+            @Override
+            public Object decodeChunkSector(byte[] uncompressed) {
+                return null;
+            }
+
+            @Override
+            public byte[] encodeRawNbt(Object tag) {
+                return null;
+            }
+
+            @Override
+            public String chunkDirRelative(StorageKind kind, String dimensionId) {
                 return null;
             }
         };

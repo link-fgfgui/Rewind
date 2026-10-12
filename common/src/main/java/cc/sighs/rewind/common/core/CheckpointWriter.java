@@ -3,7 +3,6 @@ package cc.sighs.rewind.common.core;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,6 +24,9 @@ import cc.sighs.rewind.common.spi.StorageKind;
 import cc.sighs.rewind.common.spi.StorageOverlay;
 import cc.sighs.rewind.common.store.SnapshotBlockIo;
 import cc.sighs.rewind.snapshot.AnvilDeltaAssembler;
+import cc.sighs.rewind.snapshot.AnvilFormat;
+import cc.sighs.rewind.snapshot.AtomicFiles;
+import cc.sighs.rewind.snapshot.MccName;
 import cc.sighs.rewind.snapshot.SnapshotBlockStore;
 import cc.sighs.rewind.snapshot.SnapshotBlocks;
 import cc.sighs.rewind.snapshot.SnapshotChunkDecoder;
@@ -36,7 +38,6 @@ import cc.sighs.rewind.snapshot.SnapshotMeta;
 import cc.sighs.rewind.snapshot.SnapshotMirror;
 import cc.sighs.rewind.snapshot.ZPackCheckpoint;
 import cc.sighs.rewind.snapshot.ZPackOffline;
-import cc.sighs.rewind.snapshot.ZstdDelta;
 
 /**
  * 存档点的磁盘机制：把世界强制落盘后镜像进槽位，以及把槽位镜像回活动存档。
@@ -55,9 +56,6 @@ import cc.sighs.rewind.snapshot.ZstdDelta;
  * 对外门面是 {@link cc.sighs.rewind.api.RewindApi}。
  */
 public final class CheckpointWriter {
-    /** 时间线成环保护：顺着 parentSlot 往上走最多这么多步。 */
-    private static final int TIMELINE_WALK_LIMIT = 64;
-
     /** 一次磁盘操作的结果：{@code meta} 只有建立存档点时非 null。 */
     public static final class Result {
         public final SnapshotMeta meta;
@@ -129,7 +127,7 @@ public final class CheckpointWriter {
         SnapshotMirror.Result mirror;
         SnapshotBlockIo blocks = SnapshotBlockIo.open(world, slot);
         try {
-            mirror = mirrorIncrementalOrFull(world, slot, previousManifest, blocks);
+            mirror = mirrorIncrementalOrFull(world, slot, previousManifest, blocks, platform);
             mirror.manifest.save(manifestFile);
         } finally {
             // close() 才把这次收的块真正写进 pack
@@ -144,9 +142,8 @@ public final class CheckpointWriter {
             ZPackCheckpoint.Written zpack = ZPackCheckpoint.writeSlotZpack(world, slot, base.parentSlot,
                     RewindState.storageJournal().entries(), mirror.files,
                     SnapshotLayout.slotDir(world, slot), platform);
-            RewindLog.LOGGER.info("Rewind: zpack {} written ({} entries, {} payload bytes, {})",
-                    slot, zpack.entries, zpack.payloadBytes,
-                    ZstdDelta.isAvailable() ? "zstd-native" : "deflate-fallback");
+            RewindLog.LOGGER.info("Rewind: zpack {} written ({} entries, {} payload bytes)",
+                    slot, zpack.entries, zpack.payloadBytes);
         } catch (Throwable t) {
             RewindLog.LOGGER.warn("Rewind: zpack for {} not written, block store remains authoritative", slot, t);
         }
@@ -194,7 +191,13 @@ public final class CheckpointWriter {
         SnapshotManifest reference = SnapshotManifest.load(SnapshotLayout.manifestFile(worldRoot, slot));
         SnapshotMirror.Result mirror = null;
         try {
-            mirror = ZPackOffline.rebuild(worldRoot, slot, ZPackOffline.installedLayout());
+            ZPackOffline.Outcome outcome = ZPackOffline.rebuild(worldRoot, slot, ZPackOffline.installedLayout());
+            if (outcome.applied()) {
+                mirror = outcome.result;
+            } else {
+                RewindLog.LOGGER.info("Rewind: pure-NBT rebuild of {} not applicable ({}), using block store",
+                        slot, outcome.reason);
+            }
         } catch (Throwable t) {
             RewindLog.LOGGER.warn("Rewind: pure-NBT rebuild of {} failed, falling back to block store", slot, t);
             mirror = null;
@@ -221,7 +224,8 @@ public final class CheckpointWriter {
      * 正确性优先，代价只是多读一次盘。
      */
     private static SnapshotMirror.Result mirrorIncrementalOrFull(Path world, String slot,
-            SnapshotManifest previousManifest, SnapshotBlockIo blocks) throws IOException {
+            SnapshotManifest previousManifest, SnapshotBlockIo blocks, RewindPlatform platform)
+            throws IOException {
         Path slotDir = SnapshotLayout.slotDir(world, slot);
         SnapshotMirror.Blocks ctx = blocks.context();
         // 首建点必须全量：该槽位还没有块映射（含老格式整文件槽位的迁移——全量重编码并删整文件）。
@@ -232,7 +236,7 @@ public final class CheckpointWriter {
                     SnapshotMirror.Direction.TO_SNAPSHOT, previousManifest, null, ctx);
         }
         try {
-            SnapshotMirror.Result incremental = mirrorIncremental(world, slot, previousManifest, ctx);
+            SnapshotMirror.Result incremental = mirrorIncremental(world, slot, previousManifest, ctx, platform);
             if (incremental != null) {
                 return incremental;
             }
@@ -247,16 +251,11 @@ public final class CheckpointWriter {
      * 增量建点：松散文件走磁盘镜像（小文件，stat + 按需拷贝），
      * {@code .mca/.mcc} 只用监听变更集在内存里组装（对 {@code /saves} 区块文件 0 内容读取）。
      *
-     * <p>任一变更条目编不出（平台未接入/未知维度布局）时返回 null，调用方回退全量。
+     * <p>任一变更条目编不出（未知维度布局）时返回 null，调用方回退全量。
      */
     private static SnapshotMirror.Result mirrorIncremental(Path world, String slot,
-            SnapshotManifest previousManifest, SnapshotMirror.Blocks ctx) throws IOException {
-        RewindPlatform platform;
-        try {
-            platform = RewindPlatforms.require();
-        } catch (Throwable t) {
-            return null;
-        }
+            SnapshotManifest previousManifest, SnapshotMirror.Blocks ctx, RewindPlatform platform)
+            throws IOException {
         Path slotDir = SnapshotLayout.slotDir(world, slot);
         SnapshotBlockStore store = ctx.store;
         SnapshotBlocks previous = ctx.existing == null ? SnapshotBlocks.empty() : ctx.existing;
@@ -314,7 +313,7 @@ public final class CheckpointWriter {
                 int z = xz[1];
                 int total = 5 + sector.compressed.length;
                 int sectors = (total + SnapshotBlockStore.BLOCK_SIZE - 1) / SnapshotBlockStore.BLOCK_SIZE;
-                if (sectors >= SnapshotChunkDecoder.EXTERNAL_CHUNK_THRESHOLD) {
+                if (sectors >= AnvilFormat.EXTERNAL_CHUNK_THRESHOLD) {
                     changes.put(index, AnvilDeltaAssembler.NewChunk.external(sector.versionId));
                     newMcc.put(SnapshotChunkDecoder.mccRelative(mcaRelative, x, z), sector.compressed);
                 } else {
@@ -418,7 +417,7 @@ public final class CheckpointWriter {
                 result.deleted++;
             }
         }
-        pruneEmptyDirectories(slotDir);
+        SnapshotLayout.pruneEmptyDirectories(slotDir);
         return result;
     }
 
@@ -442,60 +441,18 @@ public final class CheckpointWriter {
         int slash = normalized.lastIndexOf('/');
         String dir = slash < 0 ? "" : normalized.substring(0, slash);
         String name = slash < 0 ? normalized : normalized.substring(slash + 1);
-        if (!name.startsWith("c.") || !name.endsWith(".mcc")) {
+        MccName parsed = MccName.parse(name);
+        if (parsed == null) {
             return false;
         }
-        String coords = name.substring(2, name.length() - 4);
-        int dot = coords.indexOf('.');
-        if (dot < 0) {
-            return false;
-        }
-        int x;
-        int z;
-        try {
-            x = Integer.parseInt(coords.substring(0, dot));
-            z = Integer.parseInt(coords.substring(dot + 1));
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        String mcaRelative = SnapshotLayout.normalize(dir + "/" + SnapshotChunkDecoder.regionFileName(x, z));
+        String mcaRelative = SnapshotLayout.normalize(dir + "/"
+                + SnapshotChunkDecoder.regionFileName(parsed.x, parsed.z));
         Map<Integer, StorageOverlay.Entry> group = byFile.get(mcaRelative);
-        return group != null && group.containsKey(SnapshotChunkDecoder.chunkIndex(x, z));
+        return group != null && group.containsKey(SnapshotChunkDecoder.chunkIndex(parsed.x, parsed.z));
     }
 
     private static void copyAtomically(Path source, Path target) throws IOException {
-        Path temp = target.resolveSibling(target.getFileName().toString() + SnapshotMirror.TEMP_SUFFIX);
-        Files.copy(source, temp, StandardCopyOption.REPLACE_EXISTING);
-        try {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException atomicUnsupported) {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-        }
-    }
-
-    private static void pruneEmptyDirectories(Path root) throws IOException {
-        if (!Files.isDirectory(root)) {
-            return;
-        }
-        Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<Path>() {
-            @Override
-            public java.nio.file.FileVisitResult postVisitDirectory(Path dir, IOException exc) {
-                if (dir.equals(root)) {
-                    return java.nio.file.FileVisitResult.CONTINUE;
-                }
-                if (SnapshotLayout.isExcluded(SnapshotLayout.relativize(root, dir))) {
-                    return java.nio.file.FileVisitResult.CONTINUE;
-                }
-                try (java.nio.file.DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
-                    if (!stream.iterator().hasNext()) {
-                        Files.deleteIfExists(dir);
-                    }
-                } catch (IOException ignored) {
-                    // 非空或被占用：留着即可
-                }
-                return java.nio.file.FileVisitResult.CONTINUE;
-            }
-        });
+        AtomicFiles.copy(source, target);
     }
 
     /**
@@ -524,7 +481,7 @@ public final class CheckpointWriter {
     /** {@code slot} 是不是挂在 {@code ancestor} 下面（顺着 parentSlot 往上走）。 */
     private static boolean isDescendant(SnapshotIndex index, String slot, String ancestor) {
         String current = slot;
-        for (int step = 0; step < TIMELINE_WALK_LIMIT && current != null && !current.isEmpty(); step++) {
+        for (int step = 0; step < SnapshotIndex.TIMELINE_WALK_LIMIT && current != null && !current.isEmpty(); step++) {
             if (current.equals(ancestor)) {
                 return true;
             }

@@ -1,12 +1,10 @@
 package cc.sighs.rewind.snapshot;
 
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
@@ -105,9 +103,7 @@ public final class SnapshotMirror {
         }
     }
 
-    /** {@link #copyAtomically} 用的临时文件后缀；{@link SnapshotLayout#isExcluded(String)} 会把它排除掉。 */
-    public static final String TEMP_SUFFIX = ".rewind-tmp";
-
+    /** {@link AtomicFiles} 用的临时文件后缀；{@link SnapshotLayout#isExcluded(String)} 会把它排除掉。 */
     private SnapshotMirror() {
     }
 
@@ -207,7 +203,7 @@ public final class SnapshotMirror {
             }
         }
 
-        pruneEmptyDirectories(targetRoot);
+        SnapshotLayout.pruneEmptyDirectories(targetRoot);
         return result;
     }
 
@@ -286,13 +282,7 @@ public final class SnapshotMirror {
      * 它有正确的大小，看起来像是好的）。
      */
     private static void copyAtomically(Path source, Path target) throws IOException {
-        Path temp = target.resolveSibling(target.getFileName().toString() + TEMP_SUFFIX);
-        Files.copy(source, temp, StandardCopyOption.REPLACE_EXISTING);
-        try {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException atomicUnsupported) {
-            Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-        }
+        AtomicFiles.copy(source, target);
     }
 
     /**
@@ -359,30 +349,5 @@ public final class SnapshotMirror {
             }
         });
         return files;
-    }
-
-    private static void pruneEmptyDirectories(Path root) throws IOException {
-        if (!Files.isDirectory(root)) {
-            return;
-        }
-        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
-            @Override
-            public FileVisitResult postVisitDirectory(Path dir, IOException exc) {
-                if (dir.equals(root)) {
-                    return FileVisitResult.CONTINUE;
-                }
-                if (SnapshotLayout.isExcluded(SnapshotLayout.relativize(root, dir))) {
-                    return FileVisitResult.CONTINUE;
-                }
-                try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
-                    if (!stream.iterator().hasNext()) {
-                        Files.deleteIfExists(dir);
-                    }
-                } catch (IOException ignored) {
-                    // 目录非空或已被占用：留着即可
-                }
-                return FileVisitResult.CONTINUE;
-            }
-        });
     }
 }

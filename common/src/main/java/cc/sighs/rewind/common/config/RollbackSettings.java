@@ -73,12 +73,43 @@ public final class RollbackSettings {
      */
     public static final boolean DEFAULT_SKIP_NON_NBT_MCA = false;
 
+    /**
+     * zpack 建点写包用的 zstd 等级。默认 3：兼顾建点吞吐与补丁体积。
+     *
+     * <p>等级对建点耗时是超线性的（22 比 3 慢一个数量级以上），对体积的收益在 ≥7 之后迅速衰减——
+     * 调高之前先用真实存档实测。
+     */
+    public static final int DEFAULT_ZSTD_LEVEL = 3;
+    public static final int MIN_ZSTD_LEVEL = 1;
+    public static final int MAX_ZSTD_LEVEL = 22;
+
+    /**
+     * DELTA 路径要不要开长距离匹配（zstd {@code --long}）：旧文件与新文件的匹配距离很远时
+     * （大范围搬移）能显著提升压缩率。默认关。
+     */
+    public static final boolean DEFAULT_ZSTD_LONG = false;
+
+    /**
+     * 长距离匹配的窗口（log2 字节）。默认 27 = 128 MiB。
+     *
+     * <p>上限取 27 而不是 zstd 协议上限 31：窗口写进帧头，解压端必须有 ≥ 该值的解压窗口上限，
+     * 而 zstd-jni-1.5.7-11 没有公开的「解压端窗口上限」设置口（只有要 DCtx 指针的 native 形式，
+     * 指针拿不到），>27 的帧在别的 zstd 默认解压端上读不回来。27 对 NBT 差分已绰绰有余；
+     * 开太大还会抬高回滚解压的内存占用（玩家在等）。
+     */
+    public static final int DEFAULT_ZSTD_LONG_WINDOW_LOG = 27;
+    public static final int MIN_ZSTD_LONG_WINDOW_LOG = 10;
+    public static final int MAX_ZSTD_LONG_WINDOW_LOG = 27;
+
     private static volatile boolean syncRecipeBook = DEFAULT_SYNC_RECIPE_BOOK;
     private static volatile boolean syncChunksNearPlayer = DEFAULT_SYNC_CHUNKS_NEAR_PLAYER;
     private static volatile int cooldownSeconds = DEFAULT_COOLDOWN_SECONDS;
     private static volatile boolean rollbackOnDeath = DEFAULT_ROLLBACK_ON_DEATH;
     private static volatile boolean inPlaceRollback = DEFAULT_IN_PLACE_ROLLBACK;
     private static volatile boolean skipNonNbtMca = DEFAULT_SKIP_NON_NBT_MCA;
+    private static volatile int zstdLevel = DEFAULT_ZSTD_LEVEL;
+    private static volatile boolean zstdLong = DEFAULT_ZSTD_LONG;
+    private static volatile int zstdLongWindowLog = DEFAULT_ZSTD_LONG_WINDOW_LOG;
 
     private RollbackSettings() {
     }
@@ -123,6 +154,21 @@ public final class RollbackSettings {
         return skipNonNbtMca;
     }
 
+    /** zpack 建点写包用的 zstd 等级（1-22）。 */
+    public static int zstdLevel() {
+        return zstdLevel;
+    }
+
+    /** DELTA 路径要不要开长距离匹配。 */
+    public static boolean zstdLong() {
+        return zstdLong;
+    }
+
+    /** 长距离匹配的窗口（log2 字节，10-27）。 */
+    public static int zstdLongWindowLog() {
+        return zstdLongWindowLog;
+    }
+
     /** 配置加载 / 重载时把值抄进来。 */
     public static void apply(boolean recipeBook, boolean chunksNearPlayer, int cooldownSeconds, boolean rollbackOnDeath,
             boolean inPlaceRollback, boolean skipNonNbtMca) {
@@ -132,6 +178,13 @@ public final class RollbackSettings {
         RollbackSettings.rollbackOnDeath = rollbackOnDeath;
         RollbackSettings.inPlaceRollback = inPlaceRollback;
         RollbackSettings.skipNonNbtMca = skipNonNbtMca;
+    }
+
+    /** 配置加载 / 重载时把 zstd 三档抄进来（值各自夹到范围内）。 */
+    public static void applyZstd(int level, boolean longEnabled, int longWindowLog) {
+        setZstdLevel(level);
+        zstdLong = longEnabled;
+        setZstdLongWindowLog(longWindowLog);
     }
 
     /** 改配方书开关（只改内存；落盘由平台配置层负责）。 */
@@ -173,5 +226,31 @@ public final class RollbackSettings {
             return MIN_COOLDOWN_SECONDS;
         }
         return Math.min(value, MAX_COOLDOWN_SECONDS);
+    }
+
+    /** 改 zstd 等级（只改内存；落盘由平台配置层负责）。值夹到 {@link #MIN_ZSTD_LEVEL} - {@link #MAX_ZSTD_LEVEL}。 */
+    public static void setZstdLevel(int value) {
+        zstdLevel = clampZstdLevel(value);
+    }
+
+    /** 把 zstd 等级夹到 {@link #MIN_ZSTD_LEVEL} - {@link #MAX_ZSTD_LEVEL}。 */
+    public static int clampZstdLevel(int value) {
+        if (value < MIN_ZSTD_LEVEL) {
+            return MIN_ZSTD_LEVEL;
+        }
+        return Math.min(value, MAX_ZSTD_LEVEL);
+    }
+
+    /** 改长距离匹配窗口（只改内存；落盘由平台配置层负责）。值夹到 10 - {@value #MAX_ZSTD_LONG_WINDOW_LOG}。 */
+    public static void setZstdLongWindowLog(int value) {
+        zstdLongWindowLog = clampZstdLongWindowLog(value);
+    }
+
+    /** 把长距离匹配窗口夹到 {@link #MIN_ZSTD_LONG_WINDOW_LOG} - {@link #MAX_ZSTD_LONG_WINDOW_LOG}。 */
+    public static int clampZstdLongWindowLog(int value) {
+        if (value < MIN_ZSTD_LONG_WINDOW_LOG) {
+            return MIN_ZSTD_LONG_WINDOW_LOG;
+        }
+        return Math.min(value, MAX_ZSTD_LONG_WINDOW_LOG);
     }
 }

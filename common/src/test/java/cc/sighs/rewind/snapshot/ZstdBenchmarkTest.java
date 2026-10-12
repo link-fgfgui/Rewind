@@ -84,10 +84,8 @@ class ZstdBenchmarkTest {
         byte[] target = mutate(base, 13, 1024);
         byte[] full = ZstdDelta.compressFull(target, ZstdDelta.DEFAULT_LEVEL);
         byte[] patch = ZstdDelta.compressDelta(target, base, ZstdDelta.DEFAULT_LEVEL);
-        if (ZstdDelta.isAvailable()) {
-            assertTrue(patch.length < full.length,
-                    "patch=" + patch.length + " full=" + full.length);
-        }
+        assertTrue(patch.length < full.length,
+                "patch=" + patch.length + " full=" + full.length);
         assertTrue(java.util.Arrays.equals(target,
                 ZstdDelta.decompress(patch, base, target.length)));
         System.out.println("1KiB-change: full=" + full.length + " patch=" + patch.length);
@@ -139,7 +137,8 @@ class ZstdBenchmarkTest {
         ZPackChain chain = new ZPackChain(snapshots);
         // 预热一次（类加载/JNI 首调用不计入）
         chain.resolveAll("s" + depth, loaded);
-        chain.clear();
+        // 换一个新链（不共享缓存），测冷解析
+        chain = new ZPackChain(snapshots);
         long start = System.nanoTime();
         Map<String, byte[]> resolved = chain.resolveAll("s" + depth, loaded);
         long elapsedMs = (System.nanoTime() - start) / 1000000L;

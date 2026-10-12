@@ -31,11 +31,11 @@ import net.neoforged.neoforge.common.ModConfigSpec;
 /**
  * 服务端行为的配置。
  *
- * <p>目前分三组：{@code autoCheckpoint}（跟着原版自动保存建点、间隔分钟数）、{@code rollback}
+ * <p>目前分四组：{@code autoCheckpoint}（跟着原版自动保存建点、间隔分钟数）、{@code rollback}
  * （回溯时要不要重发配方书、要不要只同步读回玩家视野内的区块、死亡后要不要自动回溯到时间线的头、
- * 要不要走原地回滚，以及两次回溯之间的读档冷却）与
- * {@code slots}（界面上那排手动编号卡片 {@code s1}…{@code sN} 的数量）。它跟玩家有没有客户端
- * 没关系，两边都要有，是 COMMON 配置而不是 CLIENT。
+ * 要不要走原地回滚，以及两次回溯之间的读档冷却）、{@code slots}（界面上那排手动编号卡片
+ * {@code s1}…{@code sN} 的数量）与 {@code zstd}（zpack 压缩等级与 DELTA 长距离匹配）。
+ * 它跟玩家有没有客户端没关系，两边都要有，是 COMMON 配置而不是 CLIENT。
  *
  * <p>默认值、可调范围与「分钟 → tick」的换算都在 common 的 {@link AutoCheckpointSettings} /
  * {@link RollbackSettings} / {@link SlotSettings} 里；本类只负责各 loader 的读写与落盘，
@@ -67,6 +67,9 @@ public final class RewindServerConfig {
     private static final String KEY_SKIP_NON_NBT_MCA = "rollback.skipNonNbtMca";
     private static final String KEY_ROLLBACK_COOLDOWN_SECONDS = "rollback.cooldownSeconds";
     private static final String KEY_MANUAL_SLOT_COUNT = "slots.manualSlotCount";
+    private static final String KEY_ZSTD_LEVEL = "zstd.level";
+    private static final String KEY_ZSTD_LONG = "zstd.long";
+    private static final String KEY_ZSTD_LONG_WINDOW_LOG = "zstd.longWindowLog";
     // 写进文件开头的说明；一行一条，写的时候前面各加一个 `# `。
     private static final List<String> HEADER_LINES = Arrays.asList(
             "自动存档点。",
@@ -89,6 +92,12 @@ public final class RewindServerConfig {
             KEY_SKIP_NON_NBT_MCA + ": Skip non-NBT/MCA files (advancements/, stats/, icon.png; .mcc counts as MCA) in checkpoints and rollbacks.",
             KEY_ROLLBACK_COOLDOWN_SECONDS + "：读档冷却（秒），0 = 关闭。",
             KEY_ROLLBACK_COOLDOWN_SECONDS + ": Rollback cooldown in seconds, 0 = off.",
+            KEY_ZSTD_LEVEL + "：zpack 压缩等级（1-22），越高补丁越小、建点越慢。",
+            KEY_ZSTD_LEVEL + ": zpack compression level (1-22); higher = smaller patches, slower checkpoints.",
+            KEY_ZSTD_LONG + "：DELTA 差分启用长距离匹配（zstd --long），大范围搬移时压缩率更高。",
+            KEY_ZSTD_LONG + ": Enable long-distance matching (zstd --long) for DELTA patches.",
+            KEY_ZSTD_LONG_WINDOW_LOG + "：长距离匹配窗口（log2 字节，10-27），越大内存占用越高。",
+            KEY_ZSTD_LONG_WINDOW_LOG + ": Long-distance matching window (log2 bytes, 10-27).",
             "槽位布局。",
             "Slot layout.",
             KEY_MANUAL_SLOT_COUNT + "：手动槽位数量。",
@@ -105,6 +114,9 @@ public final class RewindServerConfig {
     private static volatile boolean storedInPlaceRollback = RollbackSettings.DEFAULT_IN_PLACE_ROLLBACK;
     private static volatile boolean storedSkipNonNbtMca = RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA;
     private static volatile int storedRollbackCooldownSeconds = RollbackSettings.DEFAULT_COOLDOWN_SECONDS;
+    private static volatile int storedZstdLevel = RollbackSettings.DEFAULT_ZSTD_LEVEL;
+    private static volatile boolean storedZstdLong = RollbackSettings.DEFAULT_ZSTD_LONG;
+    private static volatile int storedZstdLongWindowLog = RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG;
     // 手动槽位数量那一份值：setManualSlotCount 落盘时写的就是它。
     private static volatile int storedManualSlotCount = SlotSettings.DEFAULT_MANUAL_SLOT_COUNT;
 *///?} elif forge {
@@ -117,6 +129,9 @@ public final class RewindServerConfig {
     private static ForgeConfigSpec.BooleanValue skipNonNbtMca;
     private static ForgeConfigSpec.IntValue rollbackCooldownSeconds;
     private static ForgeConfigSpec.IntValue manualSlotCount;
+    private static ForgeConfigSpec.IntValue zstdLevel;
+    private static ForgeConfigSpec.BooleanValue zstdLong;
+    private static ForgeConfigSpec.IntValue zstdLongWindowLog;
     private static ForgeConfigSpec spec;
     // 保存下来的配置对象：界面上改完开关要立刻落盘。
     private static volatile ModConfig modConfig;
@@ -130,6 +145,9 @@ public final class RewindServerConfig {
     private static ModConfigSpec.BooleanValue skipNonNbtMca;
     private static ModConfigSpec.IntValue rollbackCooldownSeconds;
     private static ModConfigSpec.IntValue manualSlotCount;
+    private static ModConfigSpec.IntValue zstdLevel;
+    private static ModConfigSpec.BooleanValue zstdLong;
+    private static ModConfigSpec.IntValue zstdLongWindowLog;
     private static ModConfigSpec spec;
     /** 保存下来的配置对象：界面上改完开关要立刻落盘。 */
     private static volatile ModConfig modConfig;
@@ -152,6 +170,9 @@ public final class RewindServerConfig {
         boolean skipNonNbtMca = RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA;
         int cooldownSeconds = RollbackSettings.DEFAULT_COOLDOWN_SECONDS;
         int manualSlots = SlotSettings.DEFAULT_MANUAL_SLOT_COUNT;
+        int zstdLevel = RollbackSettings.DEFAULT_ZSTD_LEVEL;
+        boolean zstdLong = RollbackSettings.DEFAULT_ZSTD_LONG;
+        int zstdWindowLog = RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG;
         try {
             if (file != null && Files.isRegularFile(file)) {
                 Properties properties = new Properties();
@@ -172,6 +193,9 @@ public final class RewindServerConfig {
                         RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA);
                 cooldownSeconds = parseCooldownSeconds(properties.getProperty(KEY_ROLLBACK_COOLDOWN_SECONDS));
                 manualSlots = parseManualSlotCount(properties.getProperty(KEY_MANUAL_SLOT_COUNT));
+                zstdLevel = parseZstdLevel(properties.getProperty(KEY_ZSTD_LEVEL));
+                zstdLong = parseBoolean(properties.getProperty(KEY_ZSTD_LONG), RollbackSettings.DEFAULT_ZSTD_LONG);
+                zstdWindowLog = parseZstdWindowLog(properties.getProperty(KEY_ZSTD_LONG_WINDOW_LOG));
             }
         } catch (Throwable t) {
             Rewind.LOGGER.error("Rewind: failed to read {}; falling back to the defaults", file, t);
@@ -184,6 +208,9 @@ public final class RewindServerConfig {
             skipNonNbtMca = RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA;
             cooldownSeconds = RollbackSettings.DEFAULT_COOLDOWN_SECONDS;
             manualSlots = SlotSettings.DEFAULT_MANUAL_SLOT_COUNT;
+            zstdLevel = RollbackSettings.DEFAULT_ZSTD_LEVEL;
+            zstdLong = RollbackSettings.DEFAULT_ZSTD_LONG;
+            zstdWindowLog = RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG;
         }
 
         storedAutoCheckpointEnabled = enabled;
@@ -195,22 +222,30 @@ public final class RewindServerConfig {
         storedSkipNonNbtMca = skipNonNbtMca;
         storedRollbackCooldownSeconds = RollbackSettings.clampCooldownSeconds(cooldownSeconds);
         storedManualSlotCount = SlotSettings.clamp(manualSlots);
+        storedZstdLevel = RollbackSettings.clampZstdLevel(zstdLevel);
+        storedZstdLong = zstdLong;
+        storedZstdLongWindowLog = RollbackSettings.clampZstdLongWindowLog(zstdWindowLog);
         AutoCheckpointSettings.apply(storedAutoCheckpointEnabled, storedAutoSaveIntervalMinutes);
         RollbackSettings.apply(storedSyncRecipeBook, storedSyncChunksNearPlayer, storedRollbackCooldownSeconds,
                 storedRollbackOnDeath, storedInPlaceRollback, storedSkipNonNbtMca);
+        RollbackSettings.applyZstd(storedZstdLevel, storedZstdLong, storedZstdLongWindowLog);
         SlotSettings.apply(storedManualSlotCount);
         // 无论刚才是读出来的还是兜底出来的，都写回去一次：文件缺失时补上，值被夹过时纠正
         save();
 
         Rewind.LOGGER.info(
                 "Rewind: auto checkpoint enabled={} interval={} min, rollback syncRecipeBook={} syncChunksNearPlayer={} "
-                        + "rollbackOnDeath={} inPlaceRollback={} cooldownSeconds={}, slots manualSlotCount={}",
+                        + "rollbackOnDeath={} inPlaceRollback={} cooldownSeconds={}, slots manualSlotCount={}, "
+                        + "zstd level={} long={} windowLog={}",
                 AutoCheckpointSettings.autoCheckpointEnabled(), AutoCheckpointSettings.autoSaveIntervalMinutes(),
                 RollbackSettings.syncRecipeBook(), RollbackSettings.syncChunksNearPlayer(),
                 RollbackSettings.rollbackOnDeath(),
                 RollbackSettings.inPlaceRollback(),
                 RollbackSettings.cooldownSeconds(),
-                SlotSettings.manualSlotCount());
+                SlotSettings.manualSlotCount(),
+                RollbackSettings.zstdLevel(),
+                RollbackSettings.zstdLong(),
+                RollbackSettings.zstdLongWindowLog());
     }
 *///?}
 
@@ -280,6 +315,23 @@ public final class RewindServerConfig {
                         SlotSettings.MIN_MANUAL_SLOT_COUNT, SlotSettings.MAX_MANUAL_SLOT_COUNT);
         builder.pop();
 
+        builder.comment("压缩（zpack）。", "Compression (zpack).").push("zstd");
+        zstdLevel = builder
+                .comment("zpack 压缩等级（1-22），越高补丁越小、建点越慢。",
+                        "zpack compression level (1-22); higher = smaller patches, slower checkpoints.")
+                .defineInRange("level", RollbackSettings.DEFAULT_ZSTD_LEVEL,
+                        RollbackSettings.MIN_ZSTD_LEVEL, RollbackSettings.MAX_ZSTD_LEVEL);
+        zstdLong = builder
+                .comment("DELTA 差分启用长距离匹配（zstd --long），大范围搬移时压缩率更高。",
+                        "Enable long-distance matching (zstd --long) for DELTA patches.")
+                .define("long", RollbackSettings.DEFAULT_ZSTD_LONG);
+        zstdLongWindowLog = builder
+                .comment("长距离匹配窗口（log2 字节，10-27），越大内存占用越高。",
+                        "Long-distance matching window (log2 bytes, 10-27).")
+                .defineInRange("longWindowLog", RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG,
+                        RollbackSettings.MIN_ZSTD_LONG_WINDOW_LOG, RollbackSettings.MAX_ZSTD_LONG_WINDOW_LOG);
+        builder.pop();
+
         spec = builder.build();
 //? if forge {
         /*ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, spec);
@@ -339,6 +391,12 @@ public final class RewindServerConfig {
                     skipNonNbtMca == null
                             ? RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA
                             : skipNonNbtMca.get());
+            RollbackSettings.applyZstd(
+                    zstdLevel == null ? RollbackSettings.DEFAULT_ZSTD_LEVEL : zstdLevel.get(),
+                    zstdLong != null && zstdLong.get(),
+                    zstdLongWindowLog == null
+                            ? RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG
+                            : zstdLongWindowLog.get());
             SlotSettings.apply(manualSlotCount == null
                     ? SlotSettings.DEFAULT_MANUAL_SLOT_COUNT
                     : manualSlotCount.get());
@@ -350,17 +408,24 @@ public final class RewindServerConfig {
                     RollbackSettings.DEFAULT_ROLLBACK_ON_DEATH,
                     RollbackSettings.DEFAULT_IN_PLACE_ROLLBACK,
                     RollbackSettings.DEFAULT_SKIP_NON_NBT_MCA);
+            RollbackSettings.applyZstd(RollbackSettings.DEFAULT_ZSTD_LEVEL,
+                    RollbackSettings.DEFAULT_ZSTD_LONG,
+                    RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG);
             SlotSettings.apply(SlotSettings.DEFAULT_MANUAL_SLOT_COUNT);
         }
         Rewind.LOGGER.info(
                 "Rewind: auto checkpoint enabled={} interval={} min, rollback syncRecipeBook={} syncChunksNearPlayer={} "
-                        + "rollbackOnDeath={} inPlaceRollback={} cooldown={}s, slots manualSlotCount={}",
+                        + "rollbackOnDeath={} inPlaceRollback={} cooldown={}s, slots manualSlotCount={}, "
+                        + "zstd level={} long={} windowLog={}",
                 AutoCheckpointSettings.autoCheckpointEnabled(), AutoCheckpointSettings.autoSaveIntervalMinutes(),
                 RollbackSettings.syncRecipeBook(), RollbackSettings.syncChunksNearPlayer(),
                 RollbackSettings.rollbackOnDeath(),
                 RollbackSettings.inPlaceRollback(),
                 RollbackSettings.cooldownSeconds(),
-                SlotSettings.manualSlotCount());
+                SlotSettings.manualSlotCount(),
+                RollbackSettings.zstdLevel(),
+                RollbackSettings.zstdLong(),
+                RollbackSettings.zstdLongWindowLog());
     }
 //?}
 
@@ -550,6 +615,34 @@ public final class RewindServerConfig {
         }
     }
 
+    // 解析 zstd.level：非法值回默认，越界夹到范围内。
+    private static int parseZstdLevel(String raw) {
+        if (raw == null) {
+            return RollbackSettings.DEFAULT_ZSTD_LEVEL;
+        }
+        try {
+            return RollbackSettings.clampZstdLevel(Integer.parseInt(raw.trim()));
+        } catch (NumberFormatException e) {
+            Rewind.LOGGER.warn("Rewind: \"{}\" is not a valid zstd level; using the default {}",
+                    raw, RollbackSettings.DEFAULT_ZSTD_LEVEL);
+            return RollbackSettings.DEFAULT_ZSTD_LEVEL;
+        }
+    }
+
+    // 解析 zstd.longWindowLog：非法值回默认，越界夹到范围内。
+    private static int parseZstdWindowLog(String raw) {
+        if (raw == null) {
+            return RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG;
+        }
+        try {
+            return RollbackSettings.clampZstdLongWindowLog(Integer.parseInt(raw.trim()));
+        } catch (NumberFormatException e) {
+            Rewind.LOGGER.warn("Rewind: \"{}\" is not a valid zstd long window log; using the default {}",
+                    raw, RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG);
+            return RollbackSettings.DEFAULT_ZSTD_LONG_WINDOW_LOG;
+        }
+    }
+
     // 配置文件的位置；取不到配置目录时返回 null（读写的调用方各自兜底）。
     private static Path configFile() {
         try {
@@ -597,6 +690,9 @@ public final class RewindServerConfig {
         lines.add(KEY_SKIP_NON_NBT_MCA + "=" + storedSkipNonNbtMca);
         lines.add(KEY_ROLLBACK_COOLDOWN_SECONDS + "=" + storedRollbackCooldownSeconds);
         lines.add(KEY_MANUAL_SLOT_COUNT + "=" + storedManualSlotCount);
+        lines.add(KEY_ZSTD_LEVEL + "=" + storedZstdLevel);
+        lines.add(KEY_ZSTD_LONG + "=" + storedZstdLong);
+        lines.add(KEY_ZSTD_LONG_WINDOW_LOG + "=" + storedZstdLongWindowLog);
         try {
             Path parent = file.getParent();
             if (parent != null) {

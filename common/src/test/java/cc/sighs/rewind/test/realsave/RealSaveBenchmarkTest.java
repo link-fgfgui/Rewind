@@ -409,7 +409,8 @@ class RealSaveBenchmarkTest {
                         int z = (i / 32) + region[1] * 32;
                         SnapshotChunkDecoder.Sector sector;
                         try {
-                            sector = SnapshotChunkDecoder.readSectorFromBytes(mca, x, z);
+                            sector = SnapshotChunkDecoder.readSector(
+                                    SnapshotChunkDecoder.SectorSource.ofBytes(mca), x, z);
                         } catch (IOException bad) {
                             continue;
                         }

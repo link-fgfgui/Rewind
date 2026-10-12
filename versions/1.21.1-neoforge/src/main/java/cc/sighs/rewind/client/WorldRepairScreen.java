@@ -192,7 +192,7 @@ public final class WorldRepairScreen extends Screen {
         String summary = "";
         String failure = null;
         try {
-            FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(this.worldRoot, null);
+            FullTreeRebakeWorker.Result result = FullTreeRebakeWorker.rebake(this.worldRoot);
             summary = result.summary();
         } catch (Throwable t) {
             failure = String.valueOf(t);
