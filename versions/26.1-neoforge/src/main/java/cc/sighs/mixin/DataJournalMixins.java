@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
 import cc.sighs.mixin.RollbackAccessMixins.SavedDataStorageAccess;
+import cc.sighs.rewind.common.JournalKeys;
 import cc.sighs.rewind.common.RewindState;
 import com.mojang.serialization.Codec;
 import net.minecraft.nbt.CompoundTag;
@@ -64,15 +65,6 @@ public final class DataJournalMixins {
     private DataJournalMixins() {
     }
 
-    /** 存档数据覆盖键：写侧（保存文件）与读侧（绝对路径）拼出同一把键。 */
-    public static String savedataKey(Path file) {
-        return "savedata|" + file.toAbsolutePath().normalize().toString();
-    }
-
-    public static String playerKey(String uuid) {
-        return "player|" + uuid;
-    }
-
     /**
      * {@code .dat} 的实际写盘点：{@code scheduleSave()} 收集完脏条目后逐个调它（ioPool 线程）。
      * 同步拷一份 NBT 即走；脏过滤上游已经做过，这里不再判 {@code isDirty()}。
@@ -88,7 +80,7 @@ public final class DataJournalMixins {
                 }
                 SavedDataStorageAccess access = (SavedDataStorageAccess) (Object) this;
                 Path file = access.rewind$getDataFile(type.id());
-                RewindState.dataCover().onWritten(savedataKey(file), tag.copy());
+                RewindState.dataCover().onWritten(JournalKeys.savedataKey(file), tag.copy());
             } catch (Throwable ignored) {
                 // 监听绝不能污染原版写盘
             }
@@ -115,7 +107,7 @@ public final class DataJournalMixins {
                     return;
                 }
                 SavedDataStorageAccess access = (SavedDataStorageAccess) (Object) this;
-                String key = savedataKey(access.rewind$getDataFile(type.id()));
+                String key = JournalKeys.savedataKey(access.rewind$getDataFile(type.id()));
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }
@@ -158,7 +150,7 @@ public final class DataJournalMixins {
                 if (dataFile == null) {
                     return;
                 }
-                String key = savedataKey(dataFile);
+                String key = JournalKeys.savedataKey(dataFile);
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }
@@ -187,7 +179,7 @@ public final class DataJournalMixins {
                         TagValueOutput.createWithContext(ProblemReporter.DISCARDING, player.registryAccess());
                 player.saveWithoutId(output);
                 CompoundTag tag = output.buildResult();
-                RewindState.dataCover().onWritten(playerKey(player.getStringUUID()), tag.copy());
+                RewindState.dataCover().onWritten(JournalKeys.playerKey(player.getStringUUID()), tag.copy());
             } catch (Throwable ignored) {
                 // 监听绝不能污染原版写盘
             }
@@ -204,7 +196,7 @@ public final class DataJournalMixins {
                 if (nameAndId == null) {
                     return;
                 }
-                String key = playerKey(nameAndId.id().toString());
+                String key = JournalKeys.playerKey(nameAndId.id().toString());
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }

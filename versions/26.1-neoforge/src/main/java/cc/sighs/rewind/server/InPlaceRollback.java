@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,9 +31,12 @@ import cc.sighs.mixin.RollbackAccessMixins.ServerChunkCacheAccess;
 import cc.sighs.mixin.RollbackAccessMixins.ServerLevelAccess;
 import cc.sighs.mixin.RollbackAccessMixins.SimpleRegionStorageAccess;
 import cc.sighs.rewind.Rewind;
+import cc.sighs.rewind.common.JournalKeys;
 import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.compat.SophisticatedCoreCompat;
 import cc.sighs.rewind.common.core.SavedDataRollback;
+import cc.sighs.rewind.common.spi.RollbackJob;
+import cc.sighs.rewind.common.spi.RollbackOutcome;
 import cc.sighs.rewind.common.spi.StorageKind;
 import cc.sighs.rewind.common.spi.StorageOverlay;
 import cc.sighs.rewind.common.store.SnapshotBlockIo;
@@ -161,6 +165,9 @@ public final class InPlaceRollback {
     private static final long PARK_NANOS = 200_000L;
     /** 卸载流水线连续多少轮没有进展就放弃（剩下的交给重建那一步兜住）。 */
     private static final int STALL_ROUNDS = 40;
+
+    /** 覆盖层灌装的三类存储顺序（与 {@code liveRegionDirs} 同序：区块 / 实体 / POI）。 */
+    private static final StorageKind[] KIND_ORDER = {StorageKind.CHUNK, StorageKind.ENTITY, StorageKind.POI};
 
     /** 单次原地回滚的统计，用于日志与自测。 */
     public static final class Result {
@@ -731,7 +738,7 @@ public final class InPlaceRollback {
             collectDatRelatives(liveDir, relatives);
             for (String relative : relatives) {
                 Path liveFile = liveDir.resolve(relative);
-                String key = cc.sighs.mixin.DataJournalMixins.savedataKey(liveFile);
+                String key = JournalKeys.savedataKey(liveFile);
                 if (!seenDataKeys.add(key)) {
                     continue;
                 }
@@ -773,7 +780,7 @@ public final class InPlaceRollback {
             try {
                 Object tag = platform.decodeChunkSector(levelRaw);
                 if (tag instanceof CompoundTag) {
-                    String key = cc.sighs.mixin.DataJournalMixins.savedataKey(
+                    String key = JournalKeys.savedataKey(
                             server.getWorldPath(LevelResource.LEVEL_DATA_FILE));
                     RewindState.dataCover().onWritten(key, ((CompoundTag) tag).copy());
                     covered++;
@@ -786,7 +793,7 @@ public final class InPlaceRollback {
         Path playerDataDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             String uuid = player.getStringUUID();
-            String key = cc.sighs.mixin.DataJournalMixins.playerKey(uuid);
+            String key = JournalKeys.playerKey(uuid);
             String liveRelative;
             try {
                 liveRelative = SnapshotLayout.relativize(worldRoot, playerDataDir.resolve(uuid + ".dat"));
@@ -957,11 +964,7 @@ public final class InPlaceRollback {
         int lastPending = Integer.MAX_VALUE;
         int stalled = 0;
         for (int round = 0; round < MAX_DRAIN_ROUNDS; round++) {
-            int pending = 0;
-            for (ServerLevel level : server.getAllLevels()) {
-                levelAccess(level).rewind$entityManager().tick();
-                pending += entityManagerAccess(level).rewind$chunksToUnload().size();
-            }
+            int pending = pumpEntityUnloadsOnce(server);
             if (pending == 0) {
                 return;
             }
@@ -980,6 +983,16 @@ public final class InPlaceRollback {
             lastPending = pending;
         }
         Rewind.LOGGER.warn("Rewind: in-place rollback could not fully drain entity-chunk unloads");
+    }
+
+    /** 推进一轮实体区块卸载；返回还在排队的区块数。切片路径按轮调用它。 */
+    private static int pumpEntityUnloadsOnce(MinecraftServer server) {
+        int pending = 0;
+        for (ServerLevel level : server.getAllLevels()) {
+            levelAccess(level).rewind$entityManager().tick();
+            pending += entityManagerAccess(level).rewind$chunksToUnload().size();
+        }
+        return pending;
     }
 
     /**
@@ -1092,20 +1105,7 @@ public final class InPlaceRollback {
             if (!target.unloaded) {
                 continue;
             }
-            ServerChunkCache source = target.level.getChunkSource();
-            if (cleared.add(target.level)) {
-                sourceAccess(source).rewind$clearCache();
-            }
-            ChunkMapAccess access = mapAccess(source.chunkMap);
-            // 区块类型缓存也要作废：不然异步读回来的区块可能沿用「改世界之后」的那份类型
-            access.rewind$chunkTypeCache().remove(target.pos.pack());
-            try {
-                source.getChunk(target.pos.x(), target.pos.z(), ChunkStatus.FULL, true);
-                result.reloadedChunks++;
-            } catch (Throwable t) {
-                Rewind.LOGGER.error("Rewind: failed to reload chunk {} in {}",
-                        target.pos, target.level.dimension().identifier(), t);
-            }
+            loadOneChunk(target, cleared, result);
         }
         result.loadMs = millisSince(startedNanos);
 
@@ -1132,6 +1132,33 @@ public final class InPlaceRollback {
         result.settleMs = millisSince(settleNanos);
     }
 
+    /** 把一个目标区块同步读回（含每维度一次的缓存清理）；切片路径按区块调用它。 */
+    private static void loadOneChunk(Target target, Set<ServerLevel> cleared, Result result) {
+            ServerChunkCache source = target.level.getChunkSource();
+            if (cleared.add(target.level)) {
+                sourceAccess(source).rewind$clearCache();
+            }
+            ChunkMapAccess access = mapAccess(source.chunkMap);
+            // 区块类型缓存也要作废：不然异步读回来的区块可能沿用「改世界之后」的那份类型
+            access.rewind$chunkTypeCache().remove(target.pos.pack());
+            try {
+                source.getChunk(target.pos.x(), target.pos.z(), ChunkStatus.FULL, true);
+                result.reloadedChunks++;
+            } catch (Throwable t) {
+                Rewind.LOGGER.error("Rewind: failed to reload chunk {} in {}",
+                        target.pos, target.level.dimension().identifier(), t);
+            }
+    }
+
+    /** 实体存储里还没卸完的区块数；切片路径的「重读收尾」判据。 */
+    private static int entityUnloadPending(MinecraftServer server) {
+        int pending = 0;
+        for (ServerLevel level : server.getAllLevels()) {
+            pending += entityManagerAccess(level).rewind$chunksToUnload().size();
+        }
+        return pending;
+    }
+
     /**
      * 强制标脏与直写保障（第 13 步）：启动自然持久化收敛。
      *
@@ -1148,22 +1175,52 @@ public final class InPlaceRollback {
      */
     private static void forceDirty(MinecraftServer server, List<Target> targets) {
         for (Target target : targets) {
-            try {
-                ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
-                ChunkMapAccess access = mapAccess(chunkMap);
-                var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
-                if (holder == null) {
-                    continue;
-                }
-                if (holder.getLatestChunk() instanceof LevelChunk chunk) {
-                    // 26.1：setUnsaved(boolean) 改成无参 markUnsaved()
-                    chunk.markUnsaved();
-                    holder.refreshAccessibility();
-                }
-            } catch (Throwable t) {
-                Rewind.LOGGER.warn("Rewind: failed to mark chunk {} dirty after rollback", target.pos, t);
+            markChunkDirtyAfterRollback(target);
+        }
+        markSavedDataDirty(server);
+        // 直写保障：丢弃窗口之外走一遍标准落盘（写监听记下回滚后的状态，时间线对齐）。
+        // 显式落盘不受 saveAllChunks 的可见性/冷却过滤影响，退出世界前盘上已是快照内容。
+        Rewind.endDiscard();
+        int missing = 0;
+        for (Target target : targets) {
+            if (!saveChunkDirectAfterRollback(target)) {
+                missing++;
             }
         }
+        if (missing > 0) {
+            Rewind.LOGGER.warn(
+                    "Rewind: {} target chunks are not in memory after rollback; leaving them to the world-exit save",
+                    missing);
+        }
+        // 直写只是进队列：排空才真正落盘，否则崩在队列里就丢了
+        try {
+            flushWorkers(server);
+        } finally {
+            // 直写完成 = 新基线：写监听记下的就是之后的增量起点，撤装后重记
+            RewindState.clearStorageJournal();
+        }
+    }
+
+    /** 给一个目标区块标脏并刷新可访问性；切片路径按区块调用它。 */
+    private static void markChunkDirtyAfterRollback(Target target) {
+        try {
+            ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
+            var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
+            if (holder == null) {
+                return;
+            }
+            if (holder.getLatestChunk() instanceof LevelChunk chunk) {
+                // 26.1：setUnsaved(boolean) 改成无参 markUnsaved()
+                chunk.markUnsaved();
+                holder.refreshAccessibility();
+            }
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: failed to mark chunk {} dirty after rollback", target.pos, t);
+        }
+    }
+
+    /** 把每个维度与服务器级的存档数据全部标脏；切片路径在一个相位里调一次。 */
+    private static void markSavedDataDirty(MinecraftServer server) {
         for (ServerLevel level : server.getAllLevels()) {
             try {
                 for (Optional<SavedData> data : storageAccess(level.getDataStorage()).rewind$cache().values()) {
@@ -1180,39 +1237,26 @@ public final class InPlaceRollback {
         } catch (Throwable t) {
             Rewind.LOGGER.warn("Rewind: failed to mark server saved data dirty after rollback", t);
         }
-        // 直写保障：丢弃窗口之外走一遍标准落盘（写监听记下回滚后的状态，时间线对齐）。
-        // 显式落盘不受 saveAllChunks 的可见性/冷却过滤影响，退出世界前盘上已是快照内容。
-        Rewind.endDiscard();
-        int missing = 0;
-        for (Target target : targets) {
-            try {
-                ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
-                ChunkMapAccess access = mapAccess(chunkMap);
-                var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
-                if (holder == null) {
-                    // 重载失败的坐标：内存里没有区块可写，交给退出世界的生命周期落盘兜底
-                    missing++;
-                    continue;
-                }
-                if (holder.getLatestChunk() instanceof LevelChunk chunk) {
-                    access.rewind$saveDirect(chunk);
-                    holder.refreshAccessibility();
-                }
-            } catch (Throwable t) {
-                Rewind.LOGGER.warn("Rewind: failed to directly save chunk {} after rollback", target.pos, t);
-            }
-        }
-        if (missing > 0) {
-            Rewind.LOGGER.warn(
-                    "Rewind: {} target chunks are not in memory after rollback; leaving them to the world-exit save",
-                    missing);
-        }
-        // 直写只是进队列：排空才真正落盘，否则崩在队列里就丢了
+    }
+
+    /** 直写一个目标区块；返回 false 表示它没在内存里（交给退出世界的生命周期落盘）。 */
+    private static boolean saveChunkDirectAfterRollback(Target target) {
         try {
-            flushWorkers(server);
-        } finally {
-            // 直写完成 = 新基线：写监听记下的就是之后的增量起点，撤装后重记
-            RewindState.clearStorageJournal();
+            ChunkMap chunkMap = target.level.getChunkSource().chunkMap;
+            ChunkMapAccess access = mapAccess(chunkMap);
+            var holder = chunkMap.getUpdatingChunkIfPresent(target.pos.pack());
+            if (holder == null) {
+                // 重载失败的坐标：内存里没有区块可写，交给退出世界的生命周期落盘兜底
+                return false;
+            }
+            if (holder.getLatestChunk() instanceof LevelChunk chunk) {
+                access.rewind$saveDirect(chunk);
+                holder.refreshAccessibility();
+            }
+            return true;
+        } catch (Throwable t) {
+            Rewind.LOGGER.warn("Rewind: failed to directly save chunk {} after rollback", target.pos, t);
+            return true;
         }
     }
 
@@ -1247,7 +1291,7 @@ public final class InPlaceRollback {
      */
     private static boolean restoreWorldData(MinecraftServer server) {
         boolean restored = false;
-        String key = cc.sighs.mixin.DataJournalMixins.savedataKey(
+        String key = JournalKeys.savedataKey(
                 server.getWorldPath(LevelResource.LEVEL_DATA_FILE));
         if (RewindState.dataCover().covers(key)) {
             Object served = RewindState.dataCover().serve(key);
@@ -1319,7 +1363,7 @@ public final class InPlaceRollback {
     private static int restorePlayers(MinecraftServer server) {
         int restored = 0;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            String key = cc.sighs.mixin.DataJournalMixins.playerKey(player.getStringUUID());
+            String key = JournalKeys.playerKey(player.getStringUUID());
             if (!RewindState.dataCover().covers(key)) {
                 continue;
             }
@@ -1608,6 +1652,486 @@ public final class InPlaceRollback {
 
     private static Map<SavedDataType<?>, Optional<SavedData>> cacheOf(SavedDataStorage storage) {
         return storageAccess(storage).rewind$cache();
+    }
+
+    // ------------------------------------------------------------------ 跨 tick 的回滚作业（TODO4 阶段 2）
+
+    /**
+     * {@link RollbackJob} 的实现：把 {@link #run} 的阶段顺序原样搬进一个有状态机，每 tick 由 common
+     * 的调度器推一片（每片默认 12ms）。任何一片都不做「整段循环」——卸载流水线按轮推、灌装 / 读回 /
+     * 标脏直写按区块推；真正不可分的只剩 {@code flushWorkers} 的落盘等待与单次区块同步读
+     * （见类注释「多人在线路径」一节的已知边界）。
+     *
+     * <p>上下文由调度器保证：进来时回滚窗口与 {@code isMultiplayerRollbacking} 都已置位、世界刻
+     * 已冻住、玩家操作包已丢弃；作业自己不碰这些标记。
+     */
+    public static final class Job implements RollbackJob {
+        private static final int PHASE_PREPARE = 0;
+        private static final int PHASE_DRAIN_CHUNKS = 1;
+        private static final int PHASE_DRAIN_ENTITIES = 2;
+        private static final int PHASE_CACHES = 3;
+        private static final int PHASE_COVER = 4;
+        private static final int PHASE_COVER_DATA = 5;
+        private static final int PHASE_HOLDERS = 6;
+        private static final int PHASE_STATE = 7;
+        private static final int PHASE_LOAD = 8;
+        private static final int PHASE_SETTLE = 9;
+        private static final int PHASE_SAVED_DATA = 10;
+        private static final int PHASE_DIRTY_MARK = 11;
+        private static final int PHASE_DIRTY_SAVE = 12;
+        private static final int PHASE_DONE = 13;
+
+        /** 每一片最多推进的卸载轮数（一轮本身有界）。 */
+        private static final int ROUNDS_PER_SLICE = 8;
+        /** 每一片最多处理的区块数（灌装 / 读回 / 直写三段按区块的循环）。 */
+        private static final int CHUNKS_PER_SLICE = 24;
+        /** 每一片最多推进的实体重读轮数。 */
+        private static final int SETTLE_ROUNDS_PER_SLICE = 8;
+
+        private final MinecraftServer server;
+        private final Path worldRoot;
+        private final String slot;
+        private final Path slotDir;
+        private final Result result = new Result();
+        private final long startedNanos = System.nanoTime();
+        private final NeoForge261RewindPlatform platform = new NeoForge261RewindPlatform();
+
+        private int phase = PHASE_PREPARE;
+        private List<Target> targets = new ArrayList<>();
+        private SnapshotBlocks snapshotBlocks;
+        private List<String> dataFiles = new ArrayList<>();
+        private int covered;
+
+        private int drainPending = Integer.MAX_VALUE;
+        private int drainStalled;
+        private int drainRounds;
+
+        private Map<String, byte[]> zpackCover;
+        private SnapshotBlockStore coverStore;
+        private Iterator<Map.Entry<ServerLevel, List<ChunkPos>>> coverLevels;
+        private ServerLevel coverLevel;
+        private List<ChunkPos> coverPoses = new ArrayList<>();
+        private int coverPos;
+        private int coverKind;
+        private long coverPhaseNanos;
+
+        private int cursor;
+        private Set<ServerLevel> clearedLevels = new HashSet<>();
+        private long loadPhaseNanos;
+        private int settleRounds;
+        private int settlePending = Integer.MAX_VALUE;
+        private int missingAfterRollback;
+
+        private boolean finished;
+        private RollbackOutcome outcome;
+        private Throwable failure;
+
+        Job(MinecraftServer server, Path worldRoot, String slot) {
+            this.server = server;
+            this.worldRoot = worldRoot;
+            this.slot = slot;
+            this.slotDir = SnapshotLayout.slotDir(worldRoot, slot);
+        }
+
+        @Override
+        public String describe() {
+            return "slot=" + slot + " phase=" + phase;
+        }
+
+        @Override
+        public boolean step(long budgetNanos) {
+            if (finished) {
+                return true;
+            }
+            long deadline = System.nanoTime() + Math.max(1L, budgetNanos);
+            try {
+                while (!finished && System.nanoTime() < deadline) {
+                    advance();
+                }
+            } catch (Throwable t) {
+                Rewind.LOGGER.error("Rewind: multiplayer rollback failed", t);
+                failure = t;
+                abort();
+                finished = true;
+            }
+            return finished;
+        }
+
+        private void advance() throws Exception {
+            switch (phase) {
+                case PHASE_PREPARE:
+                    prepare();
+                    break;
+                case PHASE_DRAIN_CHUNKS:
+                    drainChunkUnloads();
+                    break;
+                case PHASE_DRAIN_ENTITIES:
+                    drainEntityChunkUnloads();
+                    break;
+                case PHASE_CACHES:
+                    invalidateAndOpenCover();
+                    break;
+                case PHASE_COVER:
+                    coverChunks();
+                    break;
+                case PHASE_COVER_DATA:
+                    coverDataFiles();
+                    break;
+                case PHASE_HOLDERS:
+                    recreateHolders(server, targets, result);
+                    result.holdersMs = millisSince(prepareNanos);
+                    result.reloadMs = result.holdersMs;
+                    phase = PHASE_STATE;
+                    break;
+                case PHASE_STATE:
+                    restoreWorldAndPlayers(server, result);
+                    cursor = 0;
+                    clearedLevels = new HashSet<>();
+                    loadPhaseNanos = System.nanoTime();
+                    phase = PHASE_LOAD;
+                    break;
+                case PHASE_LOAD:
+                    loadChunksSliced();
+                    break;
+                case PHASE_SETTLE:
+                    settleEntities();
+                    break;
+                case PHASE_SAVED_DATA:
+                    savedData();
+                    break;
+                case PHASE_DIRTY_MARK:
+                    dirtyMark();
+                    break;
+                case PHASE_DIRTY_SAVE:
+                    dirtySave();
+                    break;
+                default:
+                    finishJob();
+                    break;
+            }
+        }
+
+        private long prepareNanos;
+
+        /** 第一片：把「排队中的写入」落下去、收集受影响区块、卸载。这一段沿用同步路径的整段调用。 */
+        private void prepare() throws Exception {
+            prepareNanos = System.nanoTime();
+            Rewind.endDiscard();
+            flushWorkers(server);
+            Rewind.beginDiscard();
+            long stepNanos = System.nanoTime();
+            snapshotBlocks = SnapshotBlocks.load(SnapshotLayout.blockMapFile(worldRoot, slot));
+            try (SnapshotBlockStore headerStore = SnapshotBlockIo.openStore(worldRoot)) {
+                targets = collectTargets(server, slotDir, headerStore, snapshotBlocks, result);
+            }
+            result.collectMs = millisSince(stepNanos);
+            stepNanos = System.nanoTime();
+            unload(server, targets, result);
+            result.unloadPumpMs = millisSince(stepNanos);
+            drainPending = Integer.MAX_VALUE;
+            drainStalled = 0;
+            drainRounds = 0;
+            phase = PHASE_DRAIN_CHUNKS;
+        }
+
+        private void drainChunkUnloads() {
+            long stepNanos = System.nanoTime();
+            for (int round = 0; round < ROUNDS_PER_SLICE; round++) {
+                int pending = pumpUnloadsOnce(server);
+                drainRounds++;
+                if (pending == 0) {
+                    result.unloadPumpMs = millisSince(stepNanos);
+                    phase = PHASE_DRAIN_ENTITIES;
+                    drainPending = Integer.MAX_VALUE;
+                    drainStalled = 0;
+                    drainRounds = 0;
+                    return;
+                }
+                if (pending >= drainPending) {
+                    if (++drainStalled > STALL_ROUNDS) {
+                        Rewind.LOGGER.warn(
+                                "Rewind: in-place rollback gave up draining chunk unloads ({} still pending)",
+                                pending);
+                        result.unloadPumpMs = millisSince(stepNanos);
+                        phase = PHASE_DRAIN_ENTITIES;
+                        drainPending = Integer.MAX_VALUE;
+                        drainStalled = 0;
+                        drainRounds = 0;
+                        return;
+                    }
+                    LockSupport.parkNanos(PARK_NANOS);
+                } else {
+                    drainStalled = 0;
+                }
+                drainPending = pending;
+                if (drainRounds >= MAX_DRAIN_ROUNDS) {
+                    Rewind.LOGGER.warn(
+                            "Rewind: in-place rollback could not fully drain chunk unloads ({} still pending)",
+                            pending);
+                    result.unloadPumpMs = millisSince(stepNanos);
+                    phase = PHASE_DRAIN_ENTITIES;
+                    drainPending = Integer.MAX_VALUE;
+                    drainStalled = 0;
+                    drainRounds = 0;
+                    return;
+                }
+            }
+            result.unloadPumpMs = millisSince(stepNanos);
+        }
+
+        private void drainEntityChunkUnloads() {
+            long stepNanos = System.nanoTime();
+            for (int round = 0; round < ROUNDS_PER_SLICE; round++) {
+                int pending = pumpEntityUnloadsOnce(server);
+                drainRounds++;
+                if (pending == 0) {
+                    result.entityDrainMs = millisSince(stepNanos);
+                    phase = PHASE_CACHES;
+                    return;
+                }
+                if (pending >= drainPending) {
+                    if (++drainStalled > STALL_ROUNDS) {
+                        Rewind.LOGGER.warn(
+                                "Rewind: in-place rollback gave up draining entity-chunk unloads ({} still pending)",
+                                pending);
+                        result.entityDrainMs = millisSince(stepNanos);
+                        phase = PHASE_CACHES;
+                        return;
+                    }
+                    LockSupport.parkNanos(PARK_NANOS);
+                } else {
+                    drainStalled = 0;
+                }
+                drainPending = pending;
+                if (drainRounds >= MAX_DRAIN_ROUNDS) {
+                    Rewind.LOGGER.warn("Rewind: in-place rollback could not fully drain entity-chunk unloads");
+                    result.entityDrainMs = millisSince(stepNanos);
+                    phase = PHASE_CACHES;
+                    return;
+                }
+            }
+            result.entityDrainMs = millisSince(stepNanos);
+        }
+
+        private void invalidateAndOpenCover() throws Exception {
+            long stepNanos = System.nanoTime();
+            // 到这里被回滚接管的区块都已经从内存里丢掉了；接下来由回滚自己重建 holder，不再需要挡重建
+            Rewind.clearUnloadGuards();
+            invalidateCaches(server, targets);
+            result.cacheMs = millisSince(stepNanos);
+            result.unloadMs = result.unloadPumpMs + result.entityDrainMs + result.cacheMs;
+            try {
+                zpackCover = ZPackCheckpoint.tryResolve(worldRoot, slot);
+            } catch (Throwable t) {
+                Rewind.LOGGER.warn("Rewind: zpack cover for {} unreadable, falling back to block store", slot, t);
+                zpackCover = null;
+            }
+            coverStore = SnapshotBlockIo.openStore(worldRoot);
+            coverLevels = targetsByLevel(targets).entrySet().iterator();
+            coverLevel = null;
+            coverPoses = new ArrayList<>();
+            coverPos = 0;
+            coverKind = 0;
+            coverPhaseNanos = System.nanoTime();
+            phase = PHASE_COVER;
+        }
+
+        private void coverChunks() {
+            for (int done = 0; done < CHUNKS_PER_SLICE; done++) {
+                while (coverLevel == null || coverKind >= 3 || coverPos >= coverPoses.size()) {
+                    if (coverLevel != null) {
+                        if (++coverKind < 3) {
+                            coverPos = 0;
+                            continue;
+                        }
+                    }
+                    if (!coverLevels.hasNext()) {
+                        result.coverMs = millisSince(coverPhaseNanos);
+                        phase = PHASE_COVER_DATA;
+                        return;
+                    }
+                    coverLevel = coverLevels.next().getKey();
+                    coverPoses = targetsByLevel(targets).get(coverLevel);
+                    if (coverPoses == null) {
+                        coverPoses = new ArrayList<>();
+                    }
+                    coverKind = 0;
+                    coverPos = 0;
+                }
+                String dimensionId = coverLevel.dimension().identifier().toString();
+                String dir = platform.chunkDirRelative(KIND_ORDER[coverKind], dimensionId);
+                if (dir == null) {
+                    coverKind++;
+                    coverPos = 0;
+                    continue;
+                }
+                ChunkPos pos = coverPoses.get(coverPos++);
+                if (populateCoverForChunk(slotDir, snapshotBlocks, coverStore, zpackCover, platform,
+                        dir, KIND_ORDER[coverKind], dimensionId, pos, result)) {
+                    covered++;
+                }
+            }
+        }
+
+        private void coverDataFiles() {
+            covered += populateDataCover(server, worldRoot, zpackCover, targets, dataFiles);
+            closeCoverStore();
+            result.coverPopulated = covered;
+            result.mirror = "cover=" + covered;
+            result.mirrorCopied = covered;
+            result.mirrorSkipped = 0;
+            result.mirrorFiles = targets.size();
+            if (result.coverMs == 0L) {
+                result.coverMs = millisSince(coverPhaseNanos);
+            }
+            RewindState.armStorageCover();
+            Rewind.LOGGER.info("Rewind: storage cover populated ({} chunks, {} via zpack) in {} ms",
+                    covered, result.coverZpack, result.coverMs);
+            phase = PHASE_HOLDERS;
+        }
+
+        private void loadChunksSliced() {
+            for (int done = 0; done < CHUNKS_PER_SLICE && cursor < targets.size(); done++) {
+                Target target = targets.get(cursor++);
+                if (!target.unloaded) {
+                    continue;
+                }
+                loadOneChunk(target, clearedLevels, result);
+            }
+            if (cursor < targets.size()) {
+                return;
+            }
+            result.loadMs = millisSince(loadPhaseNanos);
+            settleRounds = 0;
+            settlePending = Integer.MAX_VALUE;
+            phase = PHASE_SETTLE;
+        }
+
+        private void settleEntities() {
+            long settleNanos = System.nanoTime();
+            for (int round = 0; round < SETTLE_ROUNDS_PER_SLICE; round++) {
+                tickEntityManagers(server);
+                settleRounds++;
+                int pending = entityUnloadPending(server);
+                if (pending == 0 && settleRounds >= 2) {
+                    result.settleMs += millisSince(settleNanos);
+                    result.reloadMs += result.loadMs + result.settleMs;
+                    phase = PHASE_SAVED_DATA;
+                    return;
+                }
+                if (pending >= settlePending) {
+                    LockSupport.parkNanos(PARK_NANOS);
+                }
+                settlePending = pending;
+                if (settleRounds >= ENTITY_SETTLE_ROUNDS) {
+                    result.settleMs += millisSince(settleNanos);
+                    result.reloadMs += result.loadMs + result.settleMs;
+                    phase = PHASE_SAVED_DATA;
+                    return;
+                }
+            }
+            result.settleMs += millisSince(settleNanos);
+        }
+
+        private void savedData() {
+            try {
+                restoreSavedData(server, dataFiles);
+            } catch (Throwable t) {
+                Rewind.LOGGER.error("Rewind: failed to reload saved data in place", t);
+            }
+            phase = PHASE_DIRTY_MARK;
+        }
+
+        private void dirtyMark() {
+            long stepNanos = System.nanoTime();
+            for (Target target : targets) {
+                markChunkDirtyAfterRollback(target);
+            }
+            markSavedDataDirty(server);
+            result.forceDirtyMs = millisSince(stepNanos);
+            // 命中数必须在撤装前取：撤装连账本一起清，取晚了恒为 0（稀疏拦截的验收口）。
+            result.coverHits = RewindState.storageJournal().serveHits() + RewindState.dataCover().serveHits();
+            closeCoverStore();
+            RewindState.disarmStorageCover();
+            Rewind.LOGGER.info("Rewind: storage cover served {} reads ({} chunks covered)",
+                    result.coverHits, covered);
+            // 直写保障在丢弃窗口之外：先关窗，写监听才记得到这批写入（回滚后的新基线）
+            Rewind.endDiscard();
+            cursor = 0;
+            missingAfterRollback = 0;
+            phase = PHASE_DIRTY_SAVE;
+        }
+
+        private void dirtySave() {
+            for (int done = 0; done < CHUNKS_PER_SLICE && cursor < targets.size(); done++) {
+                Target target = targets.get(cursor++);
+                if (!saveChunkDirectAfterRollback(target)) {
+                    missingAfterRollback++;
+                }
+            }
+            if (cursor < targets.size()) {
+                return;
+            }
+            if (missingAfterRollback > 0) {
+                Rewind.LOGGER.warn(
+                        "Rewind: {} target chunks are not in memory after rollback; leaving them to the world-exit save",
+                        missingAfterRollback);
+            }
+            // 直写只是进队列：排空才真正落盘，否则崩在队列里就丢了
+            try {
+                flushWorkers(server);
+            } finally {
+                // 直写完成 = 新基线：写监听记下的就是之后的增量起点，撤装后重记
+                RewindState.clearStorageJournal();
+            }
+            phase = PHASE_DONE;
+        }
+
+        private void finishJob() {
+            result.totalMs = millisSince(startedNanos);
+            outcome = new RollbackOutcome(result.summary(), result.mirrorCopied, result.mirrorSkipped,
+                    result.mirrorFiles, result.totalMs);
+            finished = true;
+        }
+
+        /** 槽位目录（日志与覆盖层灌装用）。 */
+        private void closeCoverStore() {
+            if (coverStore != null) {
+                try {
+                    coverStore.close();
+                } catch (Throwable t) {
+                    Rewind.LOGGER.warn("Rewind: failed to close the snapshot block store", t);
+                }
+                coverStore = null;
+            }
+        }
+
+        @Override
+        public RollbackOutcome outcome() {
+            return finished ? outcome : null;
+        }
+
+        @Override
+        public Throwable failure() {
+            return failure;
+        }
+
+        @Override
+        public boolean finished() {
+            return finished;
+        }
+
+        @Override
+        public void abort() {
+            closeCoverStore();
+            try {
+                RewindState.disarmStorageCover();
+            } catch (Throwable ignored) {
+                // 中止清理：继续往下清
+            }
+            Rewind.clearUnloadGuards();
+            finished = true;
+        }
     }
 
     // ------------------------------------------------------------------ 访问器包装

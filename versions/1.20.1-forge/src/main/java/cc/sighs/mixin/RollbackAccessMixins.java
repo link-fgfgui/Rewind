@@ -17,6 +17,7 @@ import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.DistanceManager;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.ai.village.poi.PoiManager;
 import net.minecraft.world.entity.raid.Raids;
@@ -95,6 +96,14 @@ public final class RollbackAccessMixins {
          */
         @Invoker("processUnloads")
         void rewind$processUnloads(BooleanSupplier supplier);
+
+        /**
+         * 原版私有的「玩家区块跟踪」登记口：{@code added=false} 摘掉旧登记（PlayerMap + PLAYER
+         * ticket + 清空跟踪视图），{@code added=true} 在玩家当前位置重来一遍（视距内区块重新标成待发）。
+         * 原生重载（TODO4 阶段 3）靠这一对把「服务端以为客户端已经有区块」的记忆对齐到全新客户端。
+         */
+        @Invoker("updatePlayerStatus")
+        void rewind$updatePlayerStatus(ServerPlayer player, boolean added);
 
         /**
          * 单个区块的直写通道（原版私有 {@code save(ChunkAccess)}）：第 13 步强制标脏收尾时，

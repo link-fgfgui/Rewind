@@ -7,6 +7,7 @@ import com.mojang.serialization.Dynamic;
 import cc.sighs.rewind.Rewind;
 import cc.sighs.rewind.api.RewindApi;
 import cc.sighs.rewind.api.RewindResult;
+import cc.sighs.rewind.api.RollbackCanceledException;
 import cc.sighs.rewind.server.RewindServerConfig;
 import cc.sighs.rewind.snapshot.SnapshotIndex;
 import cc.sighs.rewind.snapshot.SnapshotLayout;
@@ -83,7 +84,9 @@ public final class CheckpointController {
     private enum Work {
         NONE,
         CHECKPOINT,
-        ROLLBACK
+        ROLLBACK,
+        /** 局域网的多人回滚：走服务端切片路径（不阻塞服务端线程），结束后用原版 Respawn 重载全体客户端。 */
+        MULTIPLAYER_ROLLBACK
     }
 
     private static final int TIMEOUT_PAUSE_TICKS = 200;
@@ -345,7 +348,9 @@ public final class CheckpointController {
         lastRestoreFiles = -1;
         // 原地回滚要么被调试开关关掉、要么被 COMMON 配置关掉；两种都退回「关世界 → 覆盖 → 重开」
         if (inPlaceEnabled && RewindServerConfig.inPlaceRollback()) {
-            startWork(Work.ROLLBACK);
+            // 开局域网时走服务端切片路径（TODO4 §1.2）：远端玩家的连接由冻结 + 保活屏障兜住，
+            // 回滚结束后服务端用原版 Respawn 流程重载全体客户端；单人仍旧走同步路径。
+            startWork(isPublished(minecraft) ? Work.MULTIPLAYER_ROLLBACK : Work.ROLLBACK);
         } else {
             startWork(Work.NONE);
             phase = Phase.CLOSING_WORLD;
@@ -464,12 +469,19 @@ public final class CheckpointController {
                     return;
                 }
                 if (!workDone) {
-                    // 服务端线程还在干活。这里只能等：它正在改世界，任何并发的关世界/重开都会撞上它。
-                    // 视觉上的兜底由 RewindTransition 自己的超时守卫负责。
-                    if (phaseTicks % WORK_WARN_INTERVAL_TICKS == 0) {
-                        Rewind.LOGGER.warn("Rewind: {} is taking unusually long ({} ticks)", work, phaseTicks);
+                    // 切片回滚（局域网）：作业由服务端 tick 逐片推进，客户端这边只轮询完成。
+                    if (work == Work.MULTIPLAYER_ROLLBACK && workStarted
+                            && !RewindApi.isMultiplayerRollbackActive()) {
+                        workResult = RewindApi.lastResult();
+                        workDone = true;
+                    } else {
+                        // 同步路径上服务端线程还在干活。这里只能等：它正在改世界，任何并发的关世界/重开都会撞上它。
+                        // 视觉上的兜底由 RewindTransition 自己的超时守卫负责。
+                        if (phaseTicks % WORK_WARN_INTERVAL_TICKS == 0) {
+                            Rewind.LOGGER.warn("Rewind: {} is taking unusually long ({} ticks)", work, phaseTicks);
+                        }
+                        return;
                     }
-                    return;
                 }
                 if (work == Work.CHECKPOINT) {
                     finishCheckpoint(minecraft);
@@ -580,7 +592,9 @@ public final class CheckpointController {
             try {
                 workResult = work == Work.CHECKPOINT
                         ? RewindApi.createCheckpoint(server, slot, source)
-                        : RewindApi.rollbackInPlace(server, slot);
+                        : work == Work.MULTIPLAYER_ROLLBACK
+                                ? RewindApi.beginMultiplayerRollback(server, slot, source)
+                                : RewindApi.rollbackInPlace(server, slot, source);
             } catch (Throwable t) {
                 workFailure = t;
                 Rewind.LOGGER.error("Rewind: {} threw", work, t);
@@ -608,10 +622,17 @@ public final class CheckpointController {
     }
 
     private static void finishRollback(Minecraft minecraft) {
-        if (workFailure != null || workResult == null || !workResult.success) {
+        Throwable failure = workFailure != null ? workFailure
+                : workResult == null ? null : workResult.failure;
+        if (failure instanceof RollbackCanceledException) {
+            // 监听者用「回溯开始」事件取消了这次回滚：不许退回「关世界 → 覆盖 → 重开」那条路——
+            // 那等于绕过取消，文件照样会被盖回去。把这次取消原样报成一次失败。
+            fail(minecraft, "rewind.error.rollback_canceled", failure.getMessage());
+            return;
+        }
+        if (failure != null || workResult == null || !workResult.success) {
             // 原地回滚没做成：退回「关世界 → 覆盖 → 重开」那条已知能成的路
-            Rewind.LOGGER.warn("Rewind: in-place rollback failed, falling back to close-and-reopen",
-                    workFailure != null ? workFailure : workResult == null ? null : workResult.failure);
+            Rewind.LOGGER.warn("Rewind: in-place rollback failed, falling back to close-and-reopen", failure);
             workResult = null;
             workFailure = null;
             startWork(Work.NONE);
@@ -678,7 +699,7 @@ public final class CheckpointController {
         final Path world = worldRoot;
         startWorker("rewind-restore", () -> {
             try {
-                RewindResult result = RewindApi.restoreFiles(world, slot);
+                RewindResult result = RewindApi.restoreFiles(world, slot, requestSource);
                 workerSummary = result.summary;
                 lastRestoreCopied = result.copiedFiles;
                 lastRestoreSkipped = result.skippedFiles;
@@ -800,6 +821,12 @@ public final class CheckpointController {
         }
     }
 
+    /** 开局域网了吗：决定回滚走服务端切片路径还是单人过渡路径（TODO4 §1.2）。 */
+    private static boolean isPublished(Minecraft minecraft) {
+        return minecraft.getSingleplayerServer() != null
+                && minecraft.getSingleplayerServer().isPublished();
+    }
+
     private static void startWorker(String name, WorkerBody body) {
         workerFinished = false;
         workerFailure = null;
@@ -833,11 +860,8 @@ public final class CheckpointController {
             Rewind.LOGGER.warn("Rewind: checkpoint operations are only available in-game in a singleplayer world");
             return false;
         }
-        // 局域网开放时本地服务端会继续给别的玩家发包，冻结/重开都会影响他们，不做
-        if (minecraft.getSingleplayerServer().isPublished()) {
-            Rewind.LOGGER.warn("Rewind: refusing to checkpoint while LAN is published");
-            return false;
-        }
+        // 局域网开放时不再拒绝（TODO4 §1.2）。世界动作的分流见 beginRestore：
+        // 开局域网的回滚走服务端切片路径（冻结 + 保活屏障 + 原生重载全体客户端），单人走原来的过渡路径。
         return true;
     }
 

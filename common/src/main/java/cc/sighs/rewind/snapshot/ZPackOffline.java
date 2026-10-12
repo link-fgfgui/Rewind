@@ -177,6 +177,10 @@ public final class ZPackOffline {
         Set<String> manifestMca = new LinkedHashSet<>();
         Set<String> manifestMcc = new LinkedHashSet<>();
         for (String path : manifest.paths()) {
+            if (!manifest.hasContent(path)) {
+                // 「没动它」的记录：快照里没有它的内容，不参与完备性门（也不该被当成链洞）
+                continue;
+            }
             if (path.endsWith(".mcc")) {
                 manifestMcc.add(path);
             } else if (SnapshotBlockStore.isEncoded(path)) {
@@ -273,6 +277,9 @@ public final class ZPackOffline {
         // （与旧路“缺文件即抛”同义）。
         List<String> dataPaths = new ArrayList<>();
         for (String path : manifest.paths()) {
+            if (!manifest.hasContent(path)) {
+                continue;
+            }
             if (!path.endsWith(".mcc") && !SnapshotBlockStore.isEncoded(path)
                     && ZPackCheckpoint.isNbtDataFile(path)) {
                 dataPaths.add(path);
@@ -296,6 +303,9 @@ public final class ZPackOffline {
         // 槽位与清单两边都没有的非 .mca 路径 → 链洞，失败回退（旧路会抛，错误语义不变）。
         Set<String> loosePaths = new LinkedHashSet<>();
         for (String path : manifest.paths()) {
+            if (!manifest.hasContent(path)) {
+                continue;
+            }
             if (!path.endsWith(".mcc") && !SnapshotBlockStore.isEncoded(path)
                     && !ZPackCheckpoint.isNbtDataFile(path)) {
                 loosePaths.add(path);

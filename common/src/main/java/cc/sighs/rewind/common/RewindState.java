@@ -42,6 +42,30 @@ import cc.sighs.rewind.snapshot.SnapshotSelfHealing;
 public final class RewindState {
     private static volatile boolean discarding;
 
+    /**
+     * 多人在线回滚期标记（TODO4 §1.3）：覆盖**整个回滚期**（含开始的准备阶段），比
+     * {@link #isDiscarding()} 长——后者只覆盖「世界正在被快照覆盖」的窗口。
+     *
+     * <p>置位期间：
+     * <ul>
+     *   <li>各版本的网络 Mixin 丢弃到达的移动 / 交互 / 放置等操作包（连接与心跳放行）；</li>
+     *   <li>共享的冻结 Mixin 取消 {@code ServerLevel.tick}——世界模拟停住，连接与玩家列表照常 tick，
+     *       于是 keep-alive 不受影响；</li>
+     *   <li>客户端的过渡期界面豁免逻辑放行原生的加载屏（见 {@link #isNativeReloadPending()}）。</li>
+     * </ul>
+     *
+     * <p>失败路径必须清（调度器统一在收尾时清）。
+     */
+    private static volatile boolean multiplayerRollbacking;
+
+    /**
+     * 原生重载标记：回滚成功后正在用原版 Respawn 流程让客户端重载世界。
+     *
+     * <p>客户端侧的 {@code RewindScreens} 在过渡期间会拦掉原版加载屏，这一小段要开豁免——
+     * 原生重载靠的就是 {@code ReceivingLevelScreen} 兜底。
+     */
+    private static volatile boolean nativeReloadPending;
+
     /** {@code ChunkMap 实例 → 已排序的区块位置}。 */
     private static final Map<Object, long[]> unloadGuards = new HashMap<>();
 
@@ -64,6 +88,33 @@ public final class RewindState {
 
     public static boolean isDiscarding() {
         return discarding;
+    }
+
+    /** 进入多人在线回滚期（见 {@link #isMultiplayerRollbacking()}）。 */
+    public static void beginMultiplayerRollback() {
+        multiplayerRollbacking = true;
+    }
+
+    /** 退出多人在线回滚期；失败 / 超时路径也必须调。 */
+    public static void endMultiplayerRollback() {
+        multiplayerRollbacking = false;
+    }
+
+    public static boolean isMultiplayerRollbacking() {
+        return multiplayerRollbacking;
+    }
+
+    /** 开始原生客户端重载（见 {@link #isNativeReloadPending()}）。 */
+    public static void beginNativeReload() {
+        nativeReloadPending = true;
+    }
+
+    public static void endNativeReload() {
+        nativeReloadPending = false;
+    }
+
+    public static boolean isNativeReloadPending() {
+        return nativeReloadPending;
     }
 
     /**
@@ -159,6 +210,9 @@ public final class RewindState {
     public static void onWorldUnloaded() {
         disarmStorageCover();
         clearUnloadGuards();
+        endMultiplayerRollback();
+        endNativeReload();
+        endDiscard();
     }
 
     /**

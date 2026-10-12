@@ -5,13 +5,17 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
+import org.jetbrains.annotations.Nullable;
+import cc.sighs.rewind.api.RollbackRequest;
 import cc.sighs.rewind.common.spi.EncodedSector;
 import cc.sighs.rewind.common.spi.FlushOutcome;
 import cc.sighs.rewind.common.spi.RewindPlatform;
+import cc.sighs.rewind.common.spi.RollbackJob;
 import cc.sighs.rewind.common.spi.RollbackOutcome;
 import cc.sighs.rewind.common.spi.StorageKind;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import net.minecraft.world.level.storage.LevelResource;
@@ -76,6 +80,39 @@ public final class FabricRewindPlatform implements RewindPlatform {
         InPlaceRollback.Result rolled = InPlaceRollback.run(server(server), worldRoot, slot);
         return new RollbackOutcome(rolled.summary(), rolled.mirrorCopied, rolled.mirrorSkipped,
                 rolled.mirrorFiles, rolled.totalMs);
+    }
+
+    /**
+     * 支持跨 tick 的切片回滚（TODO4 阶段 2 的方案 A），多人路径走它。
+     *
+     * <p>Fabric 没有加载器事件总线，{@code beforeRollback} / {@code afterRollback} 用 SPI 的默认实现
+     * （放行、不通知）：想接取消 / 结束钩子的模组直接问 {@code RewindApi} 的那两个入口。
+     */
+    @Override
+    public boolean supportsSlicedRollback() {
+        return true;
+    }
+
+    @Nullable
+    @Override
+    public RollbackJob beginRollback(Object server, Path worldRoot, String slot) {
+        return new InPlaceRollback.Job(server(server), worldRoot, slot);
+    }
+
+    /** 回滚窗口开启之前广播一条「服务器正在时间回溯」——窗口开着的时候不再发我们自己产生的包。 */
+    @Override
+    public void announceRollback(Object server, String slot, String source) {
+        server(server).getPlayerList().broadcastSystemMessage(
+                Component.translatable("rewind.msg.rollback_started", slot), false);
+    }
+
+    /** 回滚成功后的原生客户端重载（TODO4 阶段 3）：全体在线客户端重下地形。 */
+    @Override
+    public void reloadClientsAfterRollback(Object server) {
+        MinecraftServer minecraftServer = server(server);
+        ClientLevelReload.reloadAll(minecraftServer);
+        minecraftServer.getPlayerList().broadcastSystemMessage(
+                Component.translatable("rewind.msg.rollback_done"), false);
     }
 
     /**

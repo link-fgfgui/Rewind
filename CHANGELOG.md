@@ -1,5 +1,48 @@
 # 更新日志
 
+## 1.0.3
+
+### 新增：专用服务器与局域网的多人在线回滚
+
+- **Dedicated Server 全流程可用**：`/rewind snapshot|restore|status|info|delete|rename|autosave` 现在注册在服务端入口，OP 等级 2（26.1 是 `COMMANDS_GAMEMASTER`）可用；控制台天然全权限，单人存档的主机不受影响。
+- **回滚不再阻塞服务端线程**：多人路径走「跨 tick 的回滚切片」（每 tick 12ms 预算、整段 120 秒上限，超时立即中止并按失败收尾）。回滚期间服务端照常处理连接与心跳，客户端不会因为 keep-alive 超时被踢；同时世界刻被冻住、玩家操作包被丢弃，回滚期间的世界状态与单人原地回滚一致。
+- **回滚完成后客户端原生重载**：用原版 `ClientboundRespawnPacket`（flags = 0，丢弃旧状态）+ `sendLevelInfo` + 区块跟踪重置，让全体在线客户端平滑重载回滚后的世界与地形；局域网主机自己也走这条（`CheckpointController` 新增 `MULTIPLAYER_ROLLBACK` 作业）。
+- **局域网不再被拒绝**：开局域网时 F7 / F8、时间树、命令都可以用——主机与远端玩家一起被切片回滚 + 原生重载覆盖。
+- **服务端忙锁**：`RewindApi.isBusy()` 现在也认服务端自己的忙标记（建点 / 回滚 / 删除 / 改名 / 切片回滚进行中），专用服务器上两个 OP 并发操作不会再撞进同一个引擎。
+
+### 新增：回溯生命周期事件
+
+- `RewindPlatform.beforeRollback` / `afterRollback` 两个 SPI 钩子：开始可取消（取消时返回 `RollbackCanceledException`，客户端不会退回「关世界 → 覆盖 → 重开」），结束不可取消，成功与失败都派发。
+- Forge / NeoForge 侧对应 `cc.sighs.rewind.event.RollbackStartEvent`（可取消，`setCancelReason`）与 `RollbackEndEvent`（带 `RewindResult`）；Fabric 用 SPI 默认实现（放行、不通知）。
+- 开始事件在回滚窗口打开**之前**派发；结束事件统一排在窗口关闭之后。
+
+### 新增：世界列表上的「读取存档点」改成完整回溯页面
+
+- 那颗按钮现在打开**时间树的离线模式**：世界还没进也能看槽位、封面、时间线，可以**读取**（先确认，再把磁盘上的世界文件覆盖回存档点）、删除、改名、**整理存档点**；建点按钮禁用。
+- 本仓库特有的「整理存档点 / GC 重烘焙」并进时间树 HUD（离线才显示），带可释放空间估算。
+
+### 改进
+
+- **单个文件动不了不再让整次建点 / 回溯失败**：被别的进程锁着、正好被删掉、写不进去、删不掉的路径会被跳过，并在清单里留一条「没动它」的记录（回溯方向不会回拷它、也不会把它当多余文件删掉），计数进镜像摘要（`untouched=` / `undeleted=`）。
+- **跨视距 / LOD 模组的运行时数据库不再进快照**：`voxy` 这类嵌在世界目录里的键值库（RocksDB 的 `LOCK` 在 Windows 上是强制锁）被排除，建点不会再因为它整段失败。
+- `/rewind status` 现在显示时间线的头、切片回滚状态与客户端状态机的阶段。
+
+### 修复
+
+- **专用服务器上原地回滚在灌装阶段崩溃**：账本键函数原先放在 `cc.sighs.mixin.DataJournalMixins` /
+  `StorageJournalMixins` 这两个 Mixin 容器类里，回滚引擎（普通代码）直接引用它们会被 Mixin 以
+  `IllegalClassLoadError: ... is in a defined mixin package ... and cannot be referenced directly`
+  拒绝加载（客户端因为类已被 Mixin 加载过、侥幸不报）。现在键函数搬进普通类
+  `cc.sighs.rewind.common.JournalKeys`，键格式与行为不变。
+
+### 内部
+
+- `/rewind` 命令层挪到 `cc.sighs.rewind.server.RewindCommands` 并由四个节点的**服务端入口**注册；`ui` / `status` 的客户端部分经 common 的中立钩子 `RewindClientHook` 转交，专用服务器上如实报告「没有客户端」。
+- 四个节点的 `InPlaceRollback` 各多一个 `Job`（`RollbackJob` 的有状态机实现：卸载按轮、灌装 / 读回 / 标脏直写按区块），并为切片抽出「单区块读回 / 标脏 / 直写」等小步；同步路径的行为完全不变。
+- `ClientLevelReload`（四份）用原版 Respawn 流程重载客户端；`ChunkMap.updatePlayerStatus` 经 `RollbackAccessMixins` 的 `@Invoker` 调用。
+- 共享 Mixin `MultiplayerRollbackMixins`（世界冻结 + 操作包丢弃）注册在四端；`RewindScreens` 增加原生重载豁免。
+
+
 ## 1.0.2
 
 ### 新增：进世界之前的「读取存档点」

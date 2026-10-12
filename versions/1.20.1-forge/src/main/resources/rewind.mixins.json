@@ -26,6 +26,8 @@
     "RollbackAccessMixins$EntitySectionManagerAccess",
     "RollbackAccessMixins$DimensionDataStorageAccess",
     "InPlaceGuardMixins$ChunkMapRecreationGuard",
+    "MultiplayerRollbackMixins$LevelFreeze",
+    "MultiplayerRollbackMixins$GameplayPacketDrop",
     "AutoCheckpointMixins$MinecraftServerAutosave",
     "StorageJournalMixins$IOWorkerJournal",
     "DataJournalMixins$SavedDataJournal",

@@ -3,6 +3,7 @@ package cc.sighs.rewind.client;
 import com.mojang.blaze3d.platform.InputConstants;
 import cc.sighs.rewind.Rewind;
 import cc.sighs.rewind.api.RewindApi;
+import cc.sighs.rewind.common.RewindClientHook;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 //? if fabric {
@@ -14,7 +15,6 @@ import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraftforge.client.event.RegisterKeyMappingsEvent;
 import net.minecraftforge.client.event.ScreenEvent;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -28,7 +28,6 @@ import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
 import net.neoforged.neoforge.client.event.RenderFrameEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
 import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.RegisterCommandsEvent;
 //?}
 //? if >=26.1 {
 /*import net.minecraft.resources.Identifier;
@@ -68,6 +67,35 @@ public final class RewindClient {
     private RewindClient() {
     }
 
+    /**
+     * 把「只有客户端才有」的那几件事装进 common 的中立钩子（{@link RewindClientHook}）：
+     * {@code /rewind ui} 与 {@code /rewind status} 的客户端部分靠它转交。命令层现在注册在服务端入口，
+     * 专用服务器上加载不到本类，那边钩子是空的、命令会如实报告。
+     */
+    private static void installClientHook() {
+        RewindClientHook.install(new RewindClientHook.Ui() {
+            @Override
+            public void openTree() {
+                RewindTreeScreen.open();
+            }
+
+            @Override
+            public String phase() {
+                return CheckpointController.phase().name();
+            }
+
+            @Override
+            public String outcome() {
+                return CheckpointController.lastOutcome().name();
+            }
+
+            @Override
+            public String message() {
+                return CheckpointController.lastMessage();
+            }
+        });
+    }
+
     // Fabric：客户端入口初始化时调用一次。按键走 KeyBindingHelper，tick 与命令走 Fabric 回调，
     // 帧钩子与原始按键由 mixin 直接调下面的 onFramePre/onFramePost/onRawKey 进来。
 //? if fabric {
@@ -76,6 +104,7 @@ public final class RewindClient {
         RewindClientConfig.register();
         // 把「带过渡的异步入口」接到状态机上：RewindApi.requestCheckpoint/requestRollback 从此等价于按 F7/F8
         CheckpointController.installApiBridge();
+        installClientHook();
         snapshotKey = KeyBindingHelper.registerKeyBinding(
                 new KeyMapping("key.rewind.snapshot", InputConstants.KEY_F7, CATEGORY));
         restoreKey = KeyBindingHelper.registerKeyBinding(
@@ -83,8 +112,6 @@ public final class RewindClient {
         treeKey = KeyBindingHelper.registerKeyBinding(
                 new KeyMapping("key.rewind.tree", InputConstants.KEY_F9, CATEGORY));
         ClientTickEvents.END_CLIENT_TICK.register(RewindClient::onClientTick);
-        CommandRegistrationCallback.EVENT.register(
-                (dispatcher, registryAccess, environment) -> RewindCommands.register(dispatcher));
         Rewind.LOGGER.info("Rewind: registered key mappings (F7=checkpoint, F8=restore, F9=time tree)");
     }
 *///?}
@@ -96,11 +123,10 @@ public final class RewindClient {
         RewindClientConfig.register(modBus);
         // 把「带过渡的异步入口」接到状态机上：RewindApi.requestCheckpoint/requestRollback 从此等价于按 F7/F8
         CheckpointController.installApiBridge();
+        installClientHook();
         modBus.addListener(RewindClient::onRegisterKeyMappings);
         MinecraftForge.EVENT_BUS.addListener(EventPriority.NORMAL, false,
                 TickEvent.ClientTickEvent.class, RewindClient::onClientTick);
-        MinecraftForge.EVENT_BUS.addListener(EventPriority.NORMAL, false,
-                RegisterCommandsEvent.class, RewindCommands::register);
         // 存档点的封面：建点的人（服务端线程）留一条待办，这里在下一帧把画面抓下来。
         // 帧开始这一下要把当前界面与 HUD 临时摘掉，所以必须排在这一帧渲染之前——RenderTickEvent 的
         // START 正是 gameRenderer.render 之前那一点（语义对应当代的 RenderFrameEvent.Pre）。
@@ -129,9 +155,9 @@ public final class RewindClient {
         ModList.get().getModContainerById(Rewind.MOD_ID).ifPresent(container -> RewindClientConfig.register(container, modBus));
         // 把「带过渡的异步入口」接到状态机上：RewindApi.requestCheckpoint/requestRollback 从此等价于按 F7/F8
         CheckpointController.installApiBridge();
+        installClientHook();
         modBus.addListener(RegisterKeyMappingsEvent.class, RewindClient::onRegisterKeyMappings);
         NeoForge.EVENT_BUS.addListener(ClientTickEvent.Post.class, RewindClient::onClientTick);
-        NeoForge.EVENT_BUS.addListener(RegisterCommandsEvent.class, RewindCommands::register);
         // 存档点的封面：建点的人（服务端线程）留一条待办，这里在下一帧把画面抓下来
         NeoForge.EVENT_BUS.addListener(RenderFrameEvent.Pre.class,
                 event -> CoverCapture.onFramePre(Minecraft.getInstance()));

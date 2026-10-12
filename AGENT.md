@@ -169,8 +169,10 @@ client            CheckpointController            客户端策略：过渡、界
 
 **迁移边界看的是「是不是 MC-无关」，不是「有没有版本差异」**：`InPlaceRollback` 里那几段（`.mca` 头部解析、存档数据回滚骨架、文件→id 分类与日志、保护/白名单判定）不碰 `net.minecraft.*`，四个 target 逐字节相同，所以都在 common（`RegionHeader` / `SavedDataRollback`）；而卸载 / 重载 / 玩家 / 世界时间那几百行**即使四个 target 逐字节相同也搬不动**——它们调用的原版内部结构要经各 target 自己的 mixin 访问器（`ChunkMapAccess` / `IOWorkerAccess` / …）和 `net.minecraft.*` 类型，common 引用不了。判据手法：`grep -rl` 比方法体 + 看签名/方法体里有没有 MC 类型或 `cc.sighs.mixin.*`。唯一剩下的一处 MC-无关重复是每个文件里那句一行的 `millisSince`（16 个调用点 × 4 份），迁移收益低于改动风险，暂时留着。
 
-- **同步入口**（直接干活，不带过渡、不碰界面）：`createCheckpoint(server, slot, source)` 与 `rollbackInPlace(server, slot)` **必须在服务端线程上调用**（进去会 `isSameThread()` 校验并报错）。没有界面就没法靠「暂停世界」保证拷贝期间没人写盘，让服务端线程忙在落盘和拷贝上等价于把它冻结——这也是要求服务端线程的原因。`restoreFiles(worldRoot, slot)` 是纯文件操作，任意线程可调。
+- **同步入口**（直接干活，不带过渡、不碰界面）：`createCheckpoint(server, slot, source)` 与 `rollbackInPlace(server, slot, source)` **必须在服务端线程上调用**（进去会 `isSameThread()` 校验并报错）。没有界面就没法靠「暂停世界」保证拷贝期间没人写盘，让服务端线程忙在落盘和拷贝上等价于把它冻结——这也是要求服务端线程的原因。`restoreFiles(worldRoot, slot, source)` 是纯文件操作，任意线程可调。
 - **带过渡的异步入口**（等价于按 F7 / F8）：`requestCheckpoint(source)` / `requestRollback(source)`。它们经 `ClientBridge` 转到 `CheckpointController`；专用服务器上没有客户端，调用返回 false 并写一条日志。这个桥做成接口就是为了让 `RewindApi` 本身不引用客户端类——主类是按 `FMLEnvironment.dist` 判定后才加载 `RewindClient` 的，`RewindApi` 必须能在专用服务器上被加载。带槽位的重载 `requestCheckpoint(slot, source)` / `requestRollback(slot, source)` 指向任意槽位；时间树界面上的「读取」走的就是它们（「覆盖」不走——它要界面一直开着，见「时间树」一节）。
+- **回溯生命周期事件**（`RollbackStartEvent` 可取消 / `RollbackEndEvent` 不可取消）：开始事件在回滚窗口打开**之前**派发（被取消时窗口没开、索引没动），结束事件成功与失败都派发，且 `afterRollback` 统一排在 `endDiscard()` **之后**（窗口已关）。取消时两个回溯入口返回的失败是 `RollbackCanceledException`，客户端控制器认得出它、**不会**退回「关世界 → 覆盖 → 重开」。Fabric 没有事件总线，两个钩子走 SPI 默认实现（放行）。
+- **跨 tick 的多人回滚入口**：`beginMultiplayerRollback(server, slot, source)` 立刻返回（`success=true` 只表示「已开始」），由各节点的服务端 tick 钩子（`RewindApi.tickMultiplayerRollback`）逐片推进；完成后结果写在 `lastResult()`，成功时自动重载全体客户端。`isMultiplayerRollbackActive()` 给界面与命令查状态。细节见「多人在线回滚」一节。
 - **原地回滚开关**：COMMON 配置 `rollback.inPlaceRollback`（`RollbackSettings.inPlaceRollback()`，默认开）。关掉之后 F8 / 界面上的「读取」都退回「关世界 → 覆盖 → 重开」那条路（`CheckpointController.beginRestore` 里是 `inPlaceEnabled && RewindServerConfig.inPlaceRollback()`）。原地回滚快，但它只保证**磁盘**与内存里那些被显式重建的状态回到过去——模组自己缓存的「解码后的世界状态」不归世界生命周期管，整合包里就可能出现「文件回滚了、游戏里看着没回滚」，那种情况就关掉这个开关。
 - **读档冷却**：一次成功回溯之后要等一段时间才能再回溯，时长是 COMMON 配置 `rollback.cooldownSeconds`（`RollbackSettings.cooldownSeconds()`，默认 `0` = 关闭，上限 3600 秒）。起点 `lastRollbackAt` 记在存档点索引里，所以退出游戏重进也绕不过去、换存档目录各算各的；只挡回溯（冷却中 `rollbackInPlace` / `restoreFiles` 直接返回失败结果），建点不受影响。要问还剩多久用 `rollbackCooldownRemainingMillis(worldRoot)`（0 = 可以读档）。**客户端 `CheckpointController.requestRestore` 必须在开过渡之前就用它拦下**（F8 / 界面上的「读取」），被拦时只写一条日志、不动界面——不然被拒的原地回滚会误触发「关世界 → 覆盖 → 重开」那条回退路径。
 - **死亡后自动回溯**：COMMON 配置 `rollback.rollbackOnDeath`（`RollbackSettings.rollbackOnDeath()`，默认关）。开着时客户端在**自己死亡的那一下**触发一次回溯（`CheckpointController.tickDeathRollback`，只在 IDLE 时看，`deathRollbackFired` 保证一次死亡只触发一次、玩家复活后重新武装），目标是**时间线的头**（`RewindApi.currentSlot` = 世界当前站着的那个存档点）；只在单人、且没在建点 / 回溯途中动手（`ensureUsable`），没有可回溯的节点就只写一条日志。因为死亡时客户端可能已经进了死亡流程，它走的仍然是 `requestRestore` 那条「先重生再回滚」（见「过渡与无界面」一节）；**重生之前会把重生点临时挪到玩家现在站的位置**（`moveRespawnPointHere`：客户端直接把任务排到集成服务器线程上——两者同进程，不用额外网络包，`forced = true` 免得原版因为脚下不是床而退回世界出生点），否则会先瞬移回出生点、再被回溯拉走，中间那一下很违和；这个临时重生点随后会被快照里的 playerdata 盖回去；**朝向也要接回来**——原版重生把俯仰角强制归零（`PlayerList.respawn` 里 `moveTo(..., yaw, 0)`），只挪重生点还是会「一复活就直视前方」，所以 `restoreViewDirection` 在开始回溯前把记下的死亡朝向（连插值用的 `yRotO` / `xRotO` 一起）写回客户端的 `LocalPlayer`。它用的过渡是专门的 `Effect.DEATH`（见「过渡与无界面」一节的死亡红边）。时间树上那个槽位会标红并挂悬浮提示，「快速存档」卡的设置弹窗里有一个开关直接改这个配置项。
@@ -188,7 +190,8 @@ client            CheckpointController            客户端策略：过渡、界
 
 F7 / F8 与时间树都是**世界里**的动作；世界一旦坏到打不开，就按不了 F8。所以世界选择界面
 （`SelectWorldScreen`）的底部按钮区多了一颗按钮：对当前选中的存档，用它的存档点把磁盘上的世界文件
-覆盖回去——这是唯一一条「进世界之前」的恢复路径。
+打开**完整的回溯页面**（时间树的离线模式，见「时间树」一节）——这是唯一一条「进世界之前」的恢复路径。
+> **TODO4 起这颗按钮打开的页面换了**：上游 `b29bd7d` 把老的 `WorldRepairScreen` 删掉、改成 `RewindTreeScreen.open(worldRoot, parent)` 的离线模式；本仓库那份特有的「整理存档点 / GC 重烘焙」按钮与估算也一并并进时间树的 HUD（离线才显示，见「时间树」一节）。离线自愈（GC 崩溃窗口）从 `open(...)` 里调一次。
 
 - **走的是离线那条管线**：目标槽位由 `RewindApi.repairSlot(worldRoot)` 挑（时间线的头，取不到时退回
   保存时间最新的完整存档点，一个都没有时返回空串），动作是 `RewindApi.restoreFiles(worldRoot, slot)`
@@ -216,7 +219,7 @@ F7 / F8 与时间树都是**世界里**的动作；世界一旦坏到打不开�
 - **它绕不过读档冷却**：`restoreFiles` 照样会因 `rollback.cooldownSeconds` 被拒，被拒时界面显示原因、
   日志里也有。
 
-**mixin 侧两条硬性经验（四个 target 通用）**：
+**mixin 侧三条硬性经验（四个 target 通用）**：
 
 1. **内层 mixin 要 `extends Screen`**，否则 `addRenderableWidget` / `repositionElements` 这些 protected
    方法跨包调不到（mixin 类与 `Screen` 不同包、也不是它的子类）。构造器只为喂 javac，Mixin 不合并它。
@@ -225,7 +228,16 @@ F7 / F8 与时间树都是**世界里**的动作；世界一旦坏到打不开�
    `@Invoker("initCapabilities")` 能过，`@Invoker("addRenderableWidget")` 会直接**编译失败**：
    `Could not locate @Invoker target ...`）。注意这条只在跑得动注解处理器的 target 上暴露
    （forge / fabric；两个 NeoForge target 没有 refmap 也不需要它，编译期不会校验）。
-2. **mixin 里不要写 lambda / 匿名类**：它们会被编成挂在 mixin 类上的合成成员，合并进目标类之后那份引用
+2. **Mixin 包里的「容器类」不能被普通代码直接引用**：`rewind.mixins.json` 的 `package` 声明了整个
+   `cc.sighs.mixin.*` 归 Mixin 所有——**注册进 mixins 列表的类**（含 `@Accessor` / `@Invoker` 的内部
+   接口）从普通代码里转型引用是允许的（回滚引擎到处这么干），但**没注册的容器类**（比如
+   `DataJournalMixins` / `StorageJournalMixins` 这种只放静态工具方法的壳子）一旦被普通代码
+   （`cc.sighs.rewind.*`）引用，Mixin 会用
+   `IllegalClassLoadError: ... is in a defined mixin package ... and cannot be referenced directly`
+   拒绝加载。**专用服务器实测会炸在原地回滚的灌装阶段**（客户端因为类早就被 Mixin 加载过而侥幸不报，
+   所以这个问题只在服务端暴露）。静态工具方法放普通包（`cc.sighs.rewind.common.JournalKeys` 就是这么
+   来的），Mixin 反过来引用普通类没有问题。
+3. **mixin 里不要写 lambda / 匿名类**：它们会被编成挂在 mixin 类上的合成成员，合并进目标类之后那份引用
    不保证还对得上。按钮的回调因此做成 `WorldRepair.PRESS`（常驻实例、方法体写在普通类里），
    「当前选中的存档」也由 mixin 通过 `WorldRepair.rememberSelection(...)` 交给普通类存着。
 
@@ -272,6 +284,60 @@ F8 默认走**原地回滚**（`cc.sighs.rewind.server.InPlaceRollback`）：世
 
 自测里的耗时口径是「过渡淡入完成、真正开始动世界」到回溯结束，不含前面的淡入，两条路径用同一把尺子（`Rewind: rewind body finished in N ms`）。
 
+### 多人在线回滚（Dedicated Server / LAN，四端一致）
+
+**这是 TODO4 落地的能力**：专用服务器与开局域网时，`/rewind restore` 不再需要「关世界 → 覆盖 → 重开」，
+回滚在活着的服务端里跨 tick 跑完，再用原版 Respawn 流程让全体在线客户端重载世界。
+
+**决议（动手前定的案，勿再重复调研）**
+
+- **keep-alive 走方案 A：回滚切片跨 tick**。版本侧的回滚引擎多了个有状态机（`InPlaceRollback.Job`，
+  接口是 common 的 `cc.sighs.rewind.common.spi.RollbackJob`）：卸载流水线按轮推、覆盖层灌装 /
+  区块读回 / 标脏直写按区块推，common 的调度器（`MultiplayerRollback`，藏在 `cc.sighs.rewind.api` 里）
+  每 tick 给 12ms 预算推进，整体预算 **120 秒**，超时立即中止（撤覆盖层、关窗口、派发失败事件，
+  **不做**客户端重载）。服务端每个 tick 都会回到 `MinecraftServer.tickChildren`，连接层与玩家列表
+  照常 tick，所以心跳应答不会迟到；方案 B（手动 pump 连接层）没有采用，它要侵入 Netty。
+- **回滚期间世界刻冻住、玩家操作包丢掉**：`RewindState.isMultiplayerRollbacking()` 置位期间，
+  共享 Mixin `MultiplayerRollbackMixins$LevelFreeze` 取消 `ServerLevel.tick`（方块 / 流体 / 实体 /
+  袭击全停；连接与心跳在 `tickChildren` 的别处，不受影响），`MultiplayerRollbackMixins$GameplayPacketDrop`
+  在 `Connection.channelRead0` 丢掉 PLAY 阶段的玩家包（**心跳应答与传送确认放行**；登录 / 配置阶段
+  不拦，回滚窗口里新玩家照样能连进来）。于是切片路径的世界状态与同步路径一致——不会出现
+  「回滚到一半世界还在改」。
+- **客户端重载用原版原生流程，flags = 0**：`ClientLevelReload.reloadAll` 给每个在线玩家发
+  `ClientboundRespawnPacket(spawnInfo, 0)`（0 = 死亡重生的语义：**客户端丢掉全部旧状态**；
+  `KEEP_ALL_DATA` 是反的）、能力 / 权限 / 位置 / `sendLevelInfo`（时间、天气、世界边界、
+  `LEVEL_CHUNKS_LOAD_START`、等级附件）/ 背包 / 效果 / 属性 / 快捷栏，最后用
+  `ChunkMap.updatePlayerStatus(player, false)` + `(player, true)` 把区块跟踪整段重置（服务端
+  「已经发过哪些区块」的记忆必须归零，否则客户端换了一个 LocalPlayer 却收不到任何地形）。
+  `RewindScreens` 的原生重载豁免（`RewindState.isNativeReloadPending()`）让这期间的加载屏照常显示。
+  > **同维度没有原版先例**：1.21.1 全树只有死亡重生与跨维度两处发 Respawn，这套顺序是照
+  > `ServerPlayer.changeDimension` 手搓的；四端的差异（1.20.1 的 `ClientboundRespawnPacket`
+  > 是老式字段构造、26.1 的 `ClientboundSetCarriedItemPacket` 改名 `ClientboundSetHeldSlotPacket`、
+  > 26.1 的 `ChunkHolder` 直接取 `getUpdatingChunkIfPresent`）都写在各自的 `ClientLevelReload` /
+  > `InPlaceRollback.Job` 注释里。
+- **命令路径分流**（TODO4 §1.2）：`/rewind` 现在注册在**服务端入口**（四个节点的主类），命令层在
+  `cc.sighs.rewind.server.RewindCommands`（不是 client 包——它必须在专用服务器上加载）。
+  判定是「专用服务器 or 已开局域网」（`serverPath()`）：服务端路径上建点走同步的
+  `RewindApi.createCheckpoint`，回滚走 `RewindApi.beginMultiplayerRollback`（切片作业）；
+  单人（未开局域网）仍旧走 F7 / F8 那条带过渡的客户端管线。**局域网不再被拒绝**。
+  `/rewind ui` 与 `status` 的客户端部分经由 common 的中立钩子
+  `cc.sighs.rewind.common.RewindClientHook` 转交：专用服务器上钩子是空的，命令如实报告。
+- **服务端 busy 锁**：`RewindApi.isBusy()` 现在是「客户端桥 busy ∪ 服务端忙计数（建点 / 回滚 /
+  删 / 改名）∪ 切片回滚进行中」——专用服务器上没有客户端桥，没有这把锁两个 OP 会同时进引擎。
+- **上机验收（2026-10-13，1.21.1-neoforge 专用服务器）**：`./gradlew :1.21.1-neoforge:runServer` 起服 +
+  RCON 发命令——`/rewind snapshot s1`（309ms，zpack 60 条目）、`/rewind status`、`/rewind info s1`、
+  `/rewind restore s1`（切片回滚 276ms：`chunks=3/49 unloaded=3 reloaded=3 worldData=yes`，
+  覆盖层 13 区块 / 6 走 zpack、`cover served 1 reads`）、再 `status` 看到 `ROLLBACK slot=s1 ok inPlace`。
+  控制台 source 天然有全部权限；`/rewind ui` 会如实报告「这台服务器上没有客户端」。
+  > 注意 `libs/` 里的 `smartkeyprompts` 在专用服务器上会因 `Screen` 类加载崩溃（与本模组无关），
+  > 起服验收时先把它挪出 `libs/`。
+- **已知边界**：① `flushWorkers`（排空排队中的落盘）与单次区块同步读是不可分的一片，个别片可能到
+  几百毫秒；② 服务端路径的建点仍是同步调用（TODO4 只要求回滚切片），大存档上命令会阻塞到建点结束；
+  ③ 切片期间世界不 tick、玩家操作包被丢弃，但他们的客户端仍在渲染旧世界（回滚完成才发 Respawn）；
+  ④ 中止（超时 / 抛异常）时世界可能停在中途状态，会按失败收尾并派发 `RollbackEndEvent`，
+  此时建议重进世界；⑤ 开局域网的**主机自己**按 F8 也走切片路径（`CheckpointController` 的
+  `Work.MULTIPLAYER_ROLLBACK`），远端与本地客户端一起被原版 Respawn 重载。
+
 ### 过渡与「无界面」（neoforge-1.21.1）
 
 F7/F8 全程不允许出现任何界面，也不往聊天框发任何提示（只写日志；`/rewind status` 是显式查询命令，保留输出）。观感由两种过渡承担：
@@ -297,7 +363,18 @@ F7/F8 全程不允许出现任何界面，也不往聊天框发任何提示（�
 
 ### 时间树（存档槽位管理界面，neoforge-1.21.1）
 
-F9 / `/rewind ui` 打开 `RewindTreeScreen`——「时间树」，一页管所有槽位：自动、快速两个特殊槽位 + 8 个手动槽位。手动槽位每张卡有读取 / 覆盖 / 重命名，**自动 / 快速这两个固定角色没有名字可改，第三个按钮是「设置」**；详情面板另有删除，还有搜索、排序、确认弹窗、设置弹窗、重命名弹窗。
+F9 / `/rewind ui` 打开 `RewindTreeScreen`——「时间树」，一页管所有槽位：自动、快速两个特殊槽位 + 8 个手动槽位。
+
+**离线模式（TODO4 起）：世界列表那颗按钮打开的也是这个页面**（上游 `b29bd7d`）。`RewindTreeScreen.open(worldRoot, parent)`
+把数据源从「集成服务端」换成传进来的存档目录：没有 `level` / `player`，所以**读取**（会先弹确认，再走
+`RewindApi.restoreFiles(worldRoot, slot, "repair")` 覆盖磁盘上的世界文件）、**删除**、**改名**、
+**整理存档点**照常可用，**建点**（覆盖 / 「在此存档」）被禁用并只写一条日志；HUD 里的世界状态显示
+「不可用」，时间线上的「在此存档」节点不出现。关界面回到世界列表（`returnTo`），离线自愈
+（GC 崩溃窗口）在 `open(...)` 时跑一次——它原先挂在被删掉的 `WorldRepairScreen` 上。
+> **本仓库特有的「整理存档点」并进了 HUD**：离线时 `#hudBar` 上多一颗 chip，显示
+> `FullTreeRebakeWorker.estimateReclaimableBytes` 估出来的可释放空间，点一下在后台跑
+> `FullTreeRebakeWorker.rebake`（跑之前 `usable()` 会拦掉重入），做完重画。它要独占 `rewind_snapshots`
+> 目录，所以**只在离线模式**出现/可用（在线点了只写一条 `rewind.ui.log.compact_online`）。手动槽位每张卡有读取 / 覆盖 / 重命名，**自动 / 快速这两个固定角色没有名字可改，第三个按钮是「设置」**；详情面板另有删除，还有搜索、排序、确认弹窗、设置弹窗、重命名弹窗。
 
 页面有两套布局，标题旁边的开关切换：**档案布局**（下面讲的就是它）与**节点树布局**（时间线，见「时间线」一节）。
 
@@ -358,7 +435,7 @@ F9 / `/rewind ui` 打开 `RewindTreeScreen`——「时间树」，一页管所�
 - **平移与缩放**：`mousedown` / `mousemove` / `mouseup` / `wheel` 四个监听都挂在 `#flowCanvas` 上——按下之后 AUI 会把 `mousemove` / `mouseup` **重派发给「按下的那个元素」**，挂在画布上光标拖到画布外面也不会丢这两个事件。位移写进 `#flowWorld` 的行内 `transform: translate(...) scale(...)`，滚轮以光标为锚。拖过 `FLOW_DRAG_SLOP` 像素之后那一下 `click` 会被吃掉（`flowMoved`），否则拖完画布会顺手把卡片选中。右上角那颗旋转按钮不参与拖拽。
 - **节点卡片**是 `.slot-card.tree-card`：角色 / 序号徽章 + 名字 + 一行摘要（多久之前 · 大小 · 群系）+ 游戏内时间，跟档案布局共用同一套交互（`data-act="select"` + `data-slot`）。横向方向下卡片收窄成三行（`order` 控制时间落在标题右边还是最后一行）。
 - **数据坏了也要画得出来**：父链成环、父节点不存在、指向自己，都在 `renderTree` 里兜底（`parentOf` 判根 + `emitted` 集合防重复递归 + 没被画出来的节点自己当根），保证每个存档点恰好出现一次。
-- **树上永远多一个「在此存档」节点**（内部标记 `NOW_NODE = "@now"`，以 `@` 开头所以永远撞不上真槽位）：它挂在时间线的**头**（`RewindApi.currentSlot`）下面、排在那一支的最后，所以一眼就能看出当前这一局是从哪个分叉岔出来的；头还没立起来（新世界、或头所在的槽位被删了）时它自己当根，一个存档点都没有时它就是树上唯一那个节点。卡片里显示当前世界的群系、坐标与游戏内时间。
+- **树上永远多一个「在此存档」节点**（内部标记 `NOW_NODE = "@now"`，以 `@` 开头所以永远撞不上真槽位；**离线模式下整格不出现**——世界还没进，没有「当前进度」可存）：它挂在时间线的**头**（`RewindApi.currentSlot`）下面、排在那一支的最后，所以一眼就能看出当前这一局是从哪个分叉岔出来的；头还没立起来（新世界、或头所在的槽位被删了）时它自己当根，一个存档点都没有时它就是树上唯一那个节点。卡片里显示当前世界的群系、坐标与游戏内时间。
   - **点它就直接存一个档**：写进**序号最小的空手动槽位**（`s1` 起，`firstFreeSlot`），走的是和「界面里覆盖」同一条后台写盘路径（`startBackgroundSave`——界面不退、不放过渡，做完由 `tick()` 收回来重画）。存完头就落在那上面，这个节点跟着挪过去，一眼能看出「刚存在哪儿」。
   - 8 个手动槽位全满时它变成一句 **「无空槽位」**（`rewind.ui.tree.no_slot`）并且不可点——卡片上没有 `data-act`，另外挂一个 `is-full` 类把光标改回箭头。
   - 它不是槽位，所以**不进详情面板**（点了不会选中它）。绿框 + 不响应悬停，和真正的存档点区分开；区分用**颜色**而不是虚线，因为 AUI 只画实线边框（`Style` 里根本没有 `border-style` 字段，`border:3px dashed …` 里的 `dashed` 会被直接丢掉）。

@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 import cc.sighs.rewind.common.RewindLog;
 import cc.sighs.rewind.common.RewindState;
@@ -74,6 +75,13 @@ public final class RewindApi {
     private static volatile ClientBridge clientBridge;
     private static volatile RewindResult lastResult;
 
+    /**
+     * 服务端侧的忙标记（TODO4 §1.2）：{@link #isBusy()} 原先只看客户端桥，专用服务器上恒 false，
+     * 两个 OP 并发 {@code /rewind restore} 会同时进引擎。所有会写同一张索引 / 同一批文件的同步入口
+     * 都在这里计数；跨 tick 的回滚由 {@link MultiplayerRollback} 自己那块状态兜住。
+     */
+    private static final AtomicInteger serverBusy = new AtomicInteger();
+
     private RewindApi() {
     }
 
@@ -93,6 +101,7 @@ public final class RewindApi {
         if (invalid != null) {
             return invalid;
         }
+        serverBusy.incrementAndGet();
         try {
             CheckpointWriter.Result written = CheckpointWriter.create(server, slot, source);
             RewindResult result = RewindResult.checkpoint(slot, written.meta, written.summary(), written.millis);
@@ -101,6 +110,8 @@ public final class RewindApi {
         } catch (Throwable t) {
             RewindLog.LOGGER.error("Rewind: checkpoint {} failed", slot, t);
             return fail(RewindResult.Kind.CHECKPOINT, slot, t);
+        } finally {
+            serverBusy.decrementAndGet();
         }
     }
 
@@ -116,6 +127,21 @@ public final class RewindApi {
      * 平台没有原地回滚引擎时返回一条失败结果（调用方按需回退到「关世界 → 覆盖 → 重开」那条路）。
      */
     public static RewindResult rollbackInPlace(Object server, String slot) {
+        return rollbackInPlace(server, slot, "api");
+    }
+
+    /**
+     * 同上，另外说明这次是谁触发的（{@code key} / {@code ui} / {@code command} / {@code death}…）。
+     *
+     * <p>它进 {@link RollbackRequest#source}，也就是进加载器事件；命令与界面都会如实传自己的来源。
+     *
+     * <p><b>开始事件可以取消</b>（{@link RewindPlatform#beforeRollback}）：被取消时不回滚，返回一条
+     * {@code failure} 为 {@link RollbackCanceledException} 的失败结果，也没有结束事件。
+     *
+     * <p>这条同步路径只给单人（集成服务器、未开局域网）用——它会把服务端线程整段占住。
+     * 专用服务器 / 局域网的多人回滚走 {@link #beginMultiplayerRollback}，那边是跨 tick 切片跑的。
+     */
+    public static RewindResult rollbackInPlace(Object server, String slot, String source) {
         RewindPlatform platform = RewindPlatforms.get();
         if (platform == null) {
             return fail(RewindResult.Kind.ROLLBACK, slot,
@@ -138,6 +164,11 @@ public final class RewindApi {
             RewindLog.LOGGER.warn("Rewind: ignoring the rollback to {}: still on cooldown", slot);
             return cooling;
         }
+        RollbackRequest request = new RollbackRequest(worldRoot, slot, source, true, describe(worldRoot, slot));
+        if (!platform.beforeRollback(request)) {
+            return canceled(request);
+        }
+        serverBusy.incrementAndGet();
         RewindResult result;
         // 回滚窗口在这一刻打开：从这里到文件还原完，任何世界落盘都是马上要被覆盖掉的
         RewindState.beginDiscard();
@@ -147,13 +178,44 @@ public final class RewindApi {
                     rolled.mirrorCopied, rolled.mirrorSkipped, rolled.mirrorFiles);
         } catch (Throwable t) {
             RewindLog.LOGGER.error("Rewind: in-place rollback for {} failed", slot, t);
-            return fail(RewindResult.Kind.ROLLBACK, slot, t);
-        } finally {
+            result = fail(RewindResult.Kind.ROLLBACK, slot, t);
             RewindState.endDiscard();
+            platform.afterRollback(request, result);
+            serverBusy.decrementAndGet();
+            return result;
         }
+        RewindState.endDiscard();
+        serverBusy.decrementAndGet();
         markRolledBack(worldRoot, slot);
         lastResult = result;
+        platform.afterRollback(request, result);
         return result;
+    }
+
+    /**
+     * 开始一次**跨 tick** 的原地回滚（TODO4 阶段 2 的切片化路径）：专用服务器与局域网的多人回滚走它。
+     *
+     * <p>立刻返回（{@code success=true} 只表示「已开始」），真正的回滚由各版本节点的服务端 tick
+     * 钩子驱动（{@link #tickMultiplayerRollback}）；结束后结果写在 {@link #lastResult()}，
+     * 成功的话会顺带用原版原生流程重载全体在线客户端。
+     *
+     * <p>**必须在服务端线程上调用**（命令与集成服务器线程都满足）。不支持切片引擎的平台
+     * （比如纯客户端桥场景）返回失败，调用方自己决定退回哪条路。
+     */
+    public static RewindResult beginMultiplayerRollback(Object server, String slot, String source) {
+        return MultiplayerRollback.begin(server, slot, source);
+    }
+
+    /**
+     * 推一片多人在线回滚；由各版本节点的服务端 tick 钩子每 tick 调一次，别的地方不要调。
+     */
+    public static void tickMultiplayerRollback(Object server) {
+        MultiplayerRollback.tick(server);
+    }
+
+    /** 现在有没有一次跨 tick 的多人回滚在跑。 */
+    public static boolean isMultiplayerRollbackActive() {
+        return MultiplayerRollback.isActive();
     }
 
     /**
@@ -162,22 +224,61 @@ public final class RewindApi {
      * <p>「关世界 → 覆盖 → 重开」那条回退路径用它；原地回滚不走这里。任意线程可调。
      */
     public static RewindResult restoreFiles(Path worldRoot, String slot) {
+        return restoreFiles(worldRoot, slot, "api");
+    }
+
+    /**
+     * 同上，另外说明这次是谁触发的（{@code ui} / {@code repair}…），进加载器事件。
+     *
+     * <p>开始事件同样可以取消：这种「世界已经关了」的场合取消不会把世界重新开起来，只是不覆盖文件。
+     * 没有安装平台实现时（纯单元测试）直接跳过事件。
+     */
+    public static RewindResult restoreFiles(Path worldRoot, String slot, String source) {
+        RewindPlatform platform = RewindPlatforms.get();
         RewindResult cooling = cooldownFailure(worldRoot, slot);
         if (cooling != null) {
             RewindLog.LOGGER.warn("Rewind: ignoring the file restore of {}: still on cooldown", slot);
             return cooling;
         }
+        RollbackRequest request = new RollbackRequest(worldRoot, slot, source, false, describe(worldRoot, slot));
+        if (platform != null && !platform.beforeRollback(request)) {
+            return canceled(request);
+        }
+        serverBusy.incrementAndGet();
         try {
             CheckpointWriter.Result copied = CheckpointWriter.restoreFiles(worldRoot, slot);
             RewindResult result = RewindResult.rollback(slot, false, copied.summary(), copied.millis,
                     copied.mirror.copied, copied.mirror.skipped, copied.mirror.files.size());
             markRolledBack(worldRoot, slot);
             lastResult = result;
+            if (platform != null) {
+                platform.afterRollback(request, result);
+            }
             return result;
         } catch (Throwable t) {
             RewindLog.LOGGER.error("Rewind: restoring files of slot {} failed", slot, t);
-            return fail(RewindResult.Kind.ROLLBACK, slot, t);
+            RewindResult result = fail(RewindResult.Kind.ROLLBACK, slot, t);
+            if (platform != null) {
+                platform.afterRollback(request, result);
+            }
+            return result;
+        } finally {
+            serverBusy.decrementAndGet();
         }
+    }
+
+    /**
+     * 被开始事件取消：什么都没做，返回一条带原因的失败结果。
+     *
+     * <p>失败类型是 {@link RollbackCanceledException}——调用方（客户端控制器）认得出这个类型，
+     * 于是不会退回文件覆盖那条路。
+     */
+    static RewindResult canceled(RollbackRequest request) {
+        String reason = request.cancelReason == null || request.cancelReason.trim().isEmpty()
+                ? "canceled by a listener"
+                : request.cancelReason.trim();
+        RewindLog.LOGGER.warn("Rewind: the rollback to {} was canceled: {}", request.slot, reason);
+        return fail(RewindResult.Kind.ROLLBACK, request.slot, new RollbackCanceledException(reason));
     }
 
     /**
@@ -187,7 +288,7 @@ public final class RewindApi {
      * <p>纯索引操作，失败了也不影响回溯本身（只写一条日志）——最坏的情况是时间线少一条边，
      * 或者冷却没记上。
      */
-    private static void markRolledBack(Path worldRoot, String slot) {
+    static void markRolledBack(Path worldRoot, String slot) {
         try {
             Path indexFile = SnapshotLayout.indexFile(worldRoot);
             SnapshotIndex index = SnapshotIndex.load(indexFile);
@@ -227,7 +328,7 @@ public final class RewindApi {
 
     /** 还在冷却中时给调用方的失败结果；不在冷却里返回 null。 */
     @Nullable
-    private static RewindResult cooldownFailure(Path worldRoot, String slot) {
+    static RewindResult cooldownFailure(Path worldRoot, String slot) {
         long remaining = rollbackCooldownRemainingMillis(worldRoot);
         if (remaining <= 0L) {
             return null;
@@ -388,11 +489,14 @@ public final class RewindApi {
             RewindLog.LOGGER.warn("Rewind: refusing to delete a checkpoint with an invalid slot name: {}", slot);
             return false;
         }
+        serverBusy.incrementAndGet();
         try {
             return SnapshotStore.delete(worldRoot, slot);
         } catch (IOException e) {
             RewindLog.LOGGER.error("Rewind: failed to delete checkpoint {}", slot, e);
             return false;
+        } finally {
+            serverBusy.decrementAndGet();
         }
     }
 
@@ -415,11 +519,14 @@ public final class RewindApi {
                     slot, displayName, SnapshotLayout.NAME_MAX_LENGTH);
             return false;
         }
+        serverBusy.incrementAndGet();
         try {
             return SnapshotStore.rename(worldRoot, slot, displayName);
         } catch (IOException e) {
             RewindLog.LOGGER.error("Rewind: failed to rename checkpoint {}", slot, e);
             return false;
+        } finally {
+            serverBusy.decrementAndGet();
         }
     }
 
@@ -462,8 +569,16 @@ public final class RewindApi {
         return true;
     }
 
-    /** 当前有没有一次操作正在进行（含过渡）。没有客户端时恒为 false。 */
+    /**
+     * 当前有没有一次操作正在进行（含过渡与跨 tick 的多人回滚）。
+     *
+     * <p>取三个来源的并集：客户端桥（单人过渡状态机）、服务端忙标记（同步入口与槽位管理）、
+     * 跨 tick 回滚调度器。专用服务器上没有客户端桥，后两个才是真正起作用的那两个。
+     */
     public static boolean isBusy() {
+        if (serverBusy.get() > 0 || MultiplayerRollback.isActive()) {
+            return true;
+        }
         ClientBridge bridge = clientBridge;
         return bridge != null && bridge.isBusy();
     }
@@ -496,16 +611,35 @@ public final class RewindApi {
 
     /** 槽位名会当目录名用，必须校验。名字不合法时返回一条失败结果，合法时返回 null。 */
     @Nullable
-    private static RewindResult invalidSlot(RewindResult.Kind kind, String slot) {
+    static RewindResult invalidSlot(RewindResult.Kind kind, String slot) {
         if (SnapshotLayout.isValidSlotName(slot)) {
             return null;
         }
         return fail(kind, slot, new IllegalArgumentException("invalid slot name: " + slot));
     }
 
-    private static RewindResult fail(RewindResult.Kind kind, String slot, Throwable t) {
+    static RewindResult fail(RewindResult.Kind kind, String slot, Throwable t) {
         RewindResult result = RewindResult.failure(kind, slot, t);
         lastResult = result;
         return result;
+    }
+
+    /** 平台没装 / 世界没加载时返回 null（跨 tick 调度器起步前的判定用）。 */
+    @Nullable
+    static Path worldRootUnchecked(Object server) {
+        RewindPlatform platform = RewindPlatforms.get();
+        if (platform == null) {
+            return null;
+        }
+        try {
+            return platform.worldRoot(server);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 记录最近一次结果（跨 tick 调度器完成时回填用）。 */
+    static void recordResult(RewindResult result) {
+        lastResult = result;
     }
 }

@@ -10,6 +10,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import cc.sighs.mixin.RollbackAccessMixins.IOWorkerAccess;
 import cc.sighs.mixin.RollbackAccessMixins.RegionFileStorageAccess;
+import cc.sighs.rewind.common.JournalKeys;
 import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.spi.StorageKind;
 import net.minecraft.nbt.CompoundTag;
@@ -27,7 +28,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 读侧（同文件下半部分）按武装状态查账，在 P1 把存档点数据灌进来并武装之前永远走原版。
  *
  * <p>1.20.1 的 `IOWorker` 没有 `storageInfo()`（1.21.1 才有），种类与维度从存档文件夹惯例反推：
- * 文件夹末段 `region` / `entities` / `poi` 定种类；维度见 {@link #dimensionOfFolder(Path)}——
+ * 文件夹末段 `region` / `entities` / `poi` 定种类；维度见 {@link JournalKeys#dimensionOfFolder(Path)}——
  * 只认标准布局（主世界 / `DIM-1` / `DIM1` / `dimensions/<ns>/<path>/`），**未识别返回 null**
  * （写侧跳过记账，回滚侧对这类维度走 `.mca` 头部比对回退）。绝不能猜成主世界：
  * 那会把自定义维度的写入错记到主世界、污染主世界快照，还会漏掉自定义维度自己的回滚。
@@ -38,73 +39,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * <p>线程与 1.21.1 那份一致：注入跑在调用方线程，账本线程安全，不加锁。
  */
 public final class StorageJournalMixins {
-    /** 文件夹路径 → 维度 id 的解析缓存；空串 = 未识别（缓存下来，同一路径不用反复 stat）。 */
-    private static final Map<Path, String> FOLDER_DIMENSIONS = new ConcurrentHashMap<>();
-
     private StorageJournalMixins() {
-    }
-
-    /**
-     * 1.20.1 的存档文件夹布局反推维度；**未识别返回 null**（写侧跳过记账，
-     * 回滚侧走 {@code .mca} 头部比对回退——猜错比不认更危险）。
-     *
-     * <ul>
-     *   <li>{@code <存档>/region|entities|poi}：父目录就是存档根（放着 {@code level.dat}）→ 主世界；</li>
-     *   <li>{@code <存档>/DIM-1/...} → 下界，{@code <存档>/DIM1/...} → 末地；</li>
-     *   <li>{@code <存档>/dimensions/<ns>/<path...>/...} → {@code <ns>:<path>}（原版目录规范，
-     *       数据包维度与多数模组走这个布局；path 段可带 {@code /}）；</li>
-     *   <li>其余布局（模组完全自定义）→ {@code null}。</li>
-     * </ul>
-     */
-    public static String dimensionOfFolder(Path folder) {
-        if (folder == null) {
-            return null;
-        }
-        String cached = FOLDER_DIMENSIONS.get(folder);
-        if (cached != null) {
-            return cached.isEmpty() ? null : cached;
-        }
-        String dimension = resolveDimension(folder);
-        FOLDER_DIMENSIONS.put(folder, dimension == null ? "" : dimension);
-        return dimension;
-    }
-
-    private static String resolveDimension(Path regionFolder) {
-        // region / entities / poi 三类存储目录的父目录就是维度根
-        Path dimensionRoot = regionFolder.getParent();
-        if (dimensionRoot == null) {
-            return null;
-        }
-        // <存档>/dimensions/<ns>/<path...>/：从后往前找最近的 dimensions 段，其后至少两段
-        List<String> segments = new ArrayList<>();
-        for (Path segment : dimensionRoot) {
-            segments.add(segment.toString());
-        }
-        for (int i = segments.size() - 3; i >= 0; i--) {
-            if (!"dimensions".equals(segments.get(i))) {
-                continue;
-            }
-            StringBuilder path = new StringBuilder();
-            for (int j = i + 2; j < segments.size(); j++) {
-                if (path.length() > 0) {
-                    path.append('/');
-                }
-                path.append(segments.get(j));
-            }
-            return segments.get(i + 1) + ":" + path;
-        }
-        String name = dimensionRoot.getFileName() == null ? null : dimensionRoot.getFileName().toString();
-        if ("DIM-1".equals(name)) {
-            return "minecraft:the_nether";
-        }
-        if ("DIM1".equals(name)) {
-            return "minecraft:the_end";
-        }
-        // 主世界：三类存储目录直接挂在存档根下，存档根放着 level.dat
-        if (Files.isRegularFile(dimensionRoot.resolve("level.dat"))) {
-            return "minecraft:overworld";
-        }
-        return null;
     }
 
     /** 三类存储的写入口：只登记，不干预（含首次写前冻结）。 */
@@ -120,7 +55,7 @@ public final class StorageJournalMixins {
             }
             Path folder = folderOf((IOWorker) (Object) this);
             StorageKind kind = kindOfFolder(folder);
-            String dimension = dimensionOfFolder(folder);
+            String dimension = JournalKeys.dimensionOfFolder(folder);
             if (kind == null || dimension == null) {
                 return;
             }
@@ -143,7 +78,7 @@ public final class StorageJournalMixins {
             }
             Path folder = folderOf((IOWorker) (Object) this);
             StorageKind kind = kindOfFolder(folder);
-            String dimension = dimensionOfFolder(folder);
+            String dimension = JournalKeys.dimensionOfFolder(folder);
             if (kind == null || dimension == null) {
                 return null;
             }
@@ -163,7 +98,7 @@ public final class StorageJournalMixins {
             }
             Path folder = folderOf((IOWorker) (Object) this);
             StorageKind kind = kindOfFolder(folder);
-            String dimension = dimensionOfFolder(folder);
+            String dimension = JournalKeys.dimensionOfFolder(folder);
             if (kind == null || dimension == null) {
                 return false;
             }

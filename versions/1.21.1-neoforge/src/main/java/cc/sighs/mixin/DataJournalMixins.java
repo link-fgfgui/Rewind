@@ -4,6 +4,7 @@ import java.io.File;
 import java.util.Map;
 import java.util.Optional;
 import cc.sighs.mixin.RollbackAccessMixins.DimensionDataStorageAccess;
+import cc.sighs.rewind.common.JournalKeys;
 import cc.sighs.rewind.common.RewindState;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
@@ -52,18 +53,6 @@ public final class DataJournalMixins {
     }
 
     /** 存档数据覆盖键：写侧（保存文件）与读侧（数据目录 + id）拼出同一把键。 */
-    public static String savedataKey(File file) {
-        return "savedata|" + file.toPath().toAbsolutePath().normalize().toString();
-    }
-
-    public static String savedataKey(File dataFolder, String id) {
-        return "savedata|" + new File(dataFolder, id + ".dat").toPath().toAbsolutePath().normalize().toString();
-    }
-
-    public static String playerKey(String uuid) {
-        return "player|" + uuid;
-    }
-
     /** {@code <维度>/data/*.dat} 的实际写盘点：同步拷一份 NBT 即走。 */
     @Mixin(SavedData.class)
     public abstract static class SavedDataJournal {
@@ -79,7 +68,7 @@ public final class DataJournalMixins {
                 CompoundTag full = new CompoundTag();
                 full.put("data", data);
                 NbtUtils.addCurrentDataVersion(full);
-                RewindState.dataCover().onWritten(savedataKey(file), full.copy());
+                RewindState.dataCover().onWritten(JournalKeys.savedataKey(file), full.copy());
             } catch (Throwable ignored) {
                 // 监听绝不能污染原版写盘
             }
@@ -104,7 +93,7 @@ public final class DataJournalMixins {
                 }
                 DimensionDataStorageAccess access = (DimensionDataStorageAccess) (Object) this;
                 File folder = access.rewind$dataFolder();
-                String key = savedataKey(folder, name);
+                String key = JournalKeys.savedataKey(folder, name);
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }
@@ -139,7 +128,7 @@ public final class DataJournalMixins {
                     return;
                 }
                 DimensionDataStorageAccess access = (DimensionDataStorageAccess) (Object) this;
-                String key = savedataKey(access.rewind$dataFolder(), filename);
+                String key = JournalKeys.savedataKey(access.rewind$dataFolder(), filename);
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }
@@ -164,7 +153,7 @@ public final class DataJournalMixins {
         private void rewind$recordPlayer(Player player, CallbackInfo ci) {
             try {
                 CompoundTag tag = player.saveWithoutId(new CompoundTag());
-                RewindState.dataCover().onWritten(playerKey(player.getStringUUID()), tag.copy());
+                RewindState.dataCover().onWritten(JournalKeys.playerKey(player.getStringUUID()), tag.copy());
             } catch (Throwable ignored) {
                 // 监听绝不能污染原版写盘
             }
@@ -178,7 +167,7 @@ public final class DataJournalMixins {
                 if (RewindState.isDiscarding() || !RewindState.isStorageCoverArmed()) {
                     return;
                 }
-                String key = playerKey(player.getStringUUID());
+                String key = JournalKeys.playerKey(player.getStringUUID());
                 if (!RewindState.dataCover().covers(key)) {
                     return;
                 }

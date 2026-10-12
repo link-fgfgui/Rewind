@@ -1,12 +1,16 @@
 package cc.sighs;
 
 import cc.sighs.rewind.client.RewindClient;
+import cc.sighs.rewind.api.RewindApi;
 import cc.sighs.rewind.common.RewindState;
 import cc.sighs.rewind.common.spi.RewindPlatforms;
 import cc.sighs.rewind.server.ForgeRewindPlatform;
+import cc.sighs.rewind.server.RewindCommands;
 import cc.sighs.rewind.server.RewindServerConfig;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartedEvent;
 import net.minecraftforge.event.server.ServerStoppedEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -52,6 +56,15 @@ public final class RewindForge {
             RewindClient.setup(modBus);
         }
         // 世界关掉之后账本键（种类，维度，坐标）会和下个世界撞车：停服时清掉全部暂态。
+        // /rewind 命令注册在**服务端入口**：专用服务器上也要有这些命令（TODO4 阶段 0）。
+        MinecraftForge.EVENT_BUS.addListener(
+                (RegisterCommandsEvent event) -> RewindCommands.register(event));
+        // 多人在线回滚（跨 tick 切片）的推进点：每 tick 推一片，连接与心跳照常跑。
+        MinecraftForge.EVENT_BUS.addListener((TickEvent.ServerTickEvent event) -> {
+            if (event.phase == TickEvent.Phase.END) {
+                RewindApi.tickMultiplayerRollback(event.getServer());
+            }
+        });
         MinecraftForge.EVENT_BUS.addListener((ServerStoppedEvent event) -> RewindState.onWorldUnloaded());
         // 启动自愈（TODO2 §4.2）：开服读完关卡即检查 GC 崩溃窗口，比任何建点/回滚都早。
         MinecraftForge.EVENT_BUS.addListener(

@@ -2,6 +2,9 @@ package cc.sighs.rewind.common.spi;
 
 import java.nio.file.Path;
 import java.util.List;
+import javax.annotation.Nullable;
+import cc.sighs.rewind.api.RewindResult;
+import cc.sighs.rewind.api.RollbackRequest;
 import cc.sighs.rewind.snapshot.SnapshotInventory;
 
 /**
@@ -109,5 +112,74 @@ public interface RewindPlatform {
      */
     default int[] unpackChunkPos(long packed) {
         return new int[]{(int) packed, (int) (packed >> 32)};
+    }
+
+    /**
+     * 回溯开始前的一次通知：返回 {@code false} 表示**取消**这次回溯，什么都不做。
+     *
+     * <p>取消原因写在 {@link RollbackRequest#cancelReason} 里（可空），它会进日志，也会跟着
+     * {@link cc.sighs.rewind.api.RollbackCanceledException} 回到调用方。
+     *
+     * <p>target 侧在这里发自己的加载器事件：Forge / NeoForge 各有一个可取消的
+     * {@code cc.sighs.rewind.event.RollbackStartEvent}。**默认实现放行**——没有事件总线的加载器
+     * （Fabric）就用默认的，别的地方想接就自己接那边的入口。
+     *
+     * <p><b>线程</b>：原地回滚那条路上它在服务端线程上被调用；只覆盖文件的那条路
+     * （世界已经关了，没有服务端线程可言）在调用它的那条线程上。
+     */
+    default boolean beforeRollback(RollbackRequest request) {
+        return true;
+    }
+
+    /**
+     * 回溯结束后的一次通知——不管成功还是失败都会来一次，**不可取消**。
+     *
+     * <p>{@code request} 就是 {@link #beforeRollback} 收到的那一个（同一次回溯复用同一个对象），
+     * {@code result} 是这次回溯的结果：{@code success} / {@code failure} / {@code summary} /
+     * {@code millis} 都在里面。被取消的那次**没有**结束通知（它根本没开始）。
+     *
+     * <p>默认实现什么都不做（Fabric）。
+     */
+    default void afterRollback(RollbackRequest request, RewindResult result) {
+    }
+
+    /**
+     * 这个平台能不能跑「跨 tick 的多人在线回滚」（TODO4 阶段 2 的切片化引擎）。
+     *
+     * <p>能跑时 {@link #beginRollback} 返回一个 {@link RollbackJob}，由 common 的
+     * {@code MultiplayerRollback} 调度器每 tick 推一片。默认不支持。
+     */
+    default boolean supportsSlicedRollback() {
+        return false;
+    }
+
+    /**
+     * 建一个跨 tick 的回滚作业；不支持或当前建不出来（世界状态不对、slot 不可还原）时返回 null。
+     *
+     * <p>调用方（{@code MultiplayerRollback}）已经把回滚窗口打开、已经把
+     * {@code RewindState.beginMultiplayerRollback()} 置位，并在作业结束时统一收尾，
+     * 所以实现只管按 {@link RollbackJob} 的分片协议干活。
+     */
+    @Nullable
+    default RollbackJob beginRollback(Object server, Path worldRoot, String slot) {
+        return null;
+    }
+
+    /**
+     * 多人在线回滚即将开始时的广播（可选）：往聊天栏发一条「服务器正在时间回溯…」。
+     *
+     * <p>必须在回滚窗口打开**之前**调用——窗口开着的时候不再发任何我们自己产生的包。
+     */
+    default void announceRollback(Object server, String slot, String source) {
+    }
+
+    /**
+     * 多人在线回滚成功后的客户端重载：用原版的原生流程（{@code ClientboundRespawnPacket}
+     * flags=0 + {@code sendLevelInfo} + 区块重跟踪）让全体在线客户端平滑重载世界与地形。
+     *
+     * <p>只在切片回滚这条路上调用（专用服务器 / 局域网上的服务端路径）；单人过渡路径不调，
+     * 那边由客户端的过渡与快速重开负责。
+     */
+    default void reloadClientsAfterRollback(Object server) {
     }
 }

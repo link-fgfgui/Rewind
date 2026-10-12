@@ -4,6 +4,7 @@ import net.minecraft.client.gui.screens.GenericMessageScreen;
 import net.minecraft.client.gui.screens.LevelLoadingScreen;
 import net.minecraft.client.gui.screens.PauseScreen;
 import net.minecraft.client.gui.screens.ProgressScreen;
+import cc.sighs.rewind.common.RewindState;
 import net.neoforged.neoforge.client.event.ScreenEvent;
 
 /**
@@ -38,6 +39,11 @@ public final class RewindScreens {
         }
         // 后处理不可用时不要拦：让原版加载屏照常显示，总比露出一段黑屏好
         if (!RewindTransitionRenderer.isEffectAvailable()) {
+            return;
+        }
+        // 原生重载（多人在线回滚）要的就是原版加载屏兜底：这一小段放行，别拦。
+        // 放行由服务端在发 Respawn / LEVEL_CHUNKS_LOAD_START 之前置位，发完就清（见 RewindState）。
+        if (RewindState.isNativeReloadPending()) {
             return;
         }
         if (event.getNewScreen() instanceof PauseScreen
