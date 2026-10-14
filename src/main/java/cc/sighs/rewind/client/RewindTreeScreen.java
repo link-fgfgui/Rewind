@@ -306,6 +306,10 @@ public final class RewindTreeScreen extends ApricityScreen {
      */
     @Override
     public void onClose() {
+        if (restoringSlot != null || compacting || savingSlot != null) {
+            log("rewind.ui.log.busy");
+            return;
+        }
         Screen back = returnTo;
         returnTo = null;
         offlineWorldRoot = null;

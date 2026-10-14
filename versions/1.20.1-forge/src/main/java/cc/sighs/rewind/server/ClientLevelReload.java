@@ -6,6 +6,8 @@ import net.minecraft.network.protocol.game.ClientboundPlayerAbilitiesPacket;
 import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
 import net.minecraft.world.level.biome.BiomeManager;
 import net.minecraft.network.protocol.game.ClientboundSetCarriedItemPacket;
+import net.minecraft.network.protocol.game.ClientboundSetExperiencePacket;
+import net.minecraft.network.protocol.game.ClientboundSetHealthPacket;
 import net.minecraft.network.protocol.game.ClientboundUpdateAttributesPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -79,8 +81,13 @@ public final class ClientLevelReload {
         player.connection.resetPosition();
         // 4. 世界信息全套：边界、时间、出生点、天气、LEVEL_CHUNKS_LOAD_START、等级附件
         server.getPlayerList().sendLevelInfo(player, level);
-        // 5. 背包 / 快捷栏 / 效果 / 属性：客户端那份是全新的，全部重推
+        // 5. 背包 / 快捷栏 / 效果 / 属性 / 经验 / 生命值：客户端那份是全新的，全部重推
         server.getPlayerList().sendAllPlayerInfo(player);
+        if (player.containerMenu != player.inventoryMenu) {
+            player.closeContainer();
+        }
+        player.initInventoryMenu();
+        player.inventoryMenu.broadcastFullState();
         // 1.20.1 的 PlayerList 没有公开的「重发效果」方法（原版在进服流程里内联），这里照抄那份内联
         for (net.minecraft.world.effect.MobEffectInstance effect : player.getActiveEffects()) {
             player.connection.send(new net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket(
@@ -89,6 +96,12 @@ public final class ClientLevelReload {
         player.connection.send(new ClientboundSetCarriedItemPacket(player.getInventory().selected));
         player.connection.send(new ClientboundUpdateAttributesPacket(player.getId(),
                 player.getAttributes().getSyncableAttributes()));
+        player.connection.send(new ClientboundSetExperiencePacket(
+                player.experienceProgress, player.totalExperience, player.experienceLevel));
+        player.setHealth(player.getHealth());
+        player.connection.send(new ClientboundSetHealthPacket(
+                player.getHealth(), player.getFoodData().getFoodLevel(), player.getFoodData().getSaturationLevel()));
+        player.resetSentInfo();
         // 6. 重置区块跟踪：先按原版「移除玩家」的语义清掉登记，再按「加入玩家」重来一遍——
         //    PlayerMap 与 PLAYER ticket 都重新落在当前位置上，视距内的区块全部重新标成待发。
         //    等价于原版跨维度时 addDuringTeleport 走的那条 updatePlayerStatus(player, true)，

@@ -61,6 +61,10 @@ class SnapshotLayoutTest {
             assertFalse(SnapshotLayout.isExcluded("datapacks/pack.mcmeta"));
             assertFalse(SnapshotLayout.isExcluded("serverconfig/mod.toml"));
             assertTrue(SnapshotLayout.isExcluded("session.lock"));
+            assertTrue(SnapshotLayout.isExcluded(".compact_tmp"));
+            assertTrue(SnapshotLayout.isExcluded(".compact_tmp/sub/file.dat"));
+            assertTrue(SnapshotLayout.isExcluded(".compact_old"));
+            assertTrue(SnapshotLayout.isExcluded(".compact_old/sub/file.dat"));
         }
     }
 }

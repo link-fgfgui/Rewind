@@ -264,6 +264,9 @@ public final class SnapshotLayout {
         if (first.equals(ROOT_DIR_NAME)) {
             return true;
         }
+        if (first.equals(COMPACT_TMP_NAME) || first.equals(COMPACT_OLD_NAME)) {
+            return true;
+        }
         if (MOD_RUNTIME_DIRS.contains(first)) {
             return true;
         }

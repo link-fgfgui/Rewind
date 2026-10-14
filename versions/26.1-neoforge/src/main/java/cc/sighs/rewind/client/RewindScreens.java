@@ -42,8 +42,9 @@ public final class RewindScreens {
             return;
         }
         // 原生重载（多人在线回滚）要的就是原版加载屏兜底：这一小段放行，别拦。
-        // 放行由服务端在发 Respawn / LEVEL_CHUNKS_LOAD_START 之前置位，发完就清（见 RewindState）。
-        if (RewindState.isNativeReloadPending()) {
+        // 放行由服务端在发 Respawn / LEVEL_CHUNKS_LOAD_START 之前置位，发完就清（见 RewindState）；
+        // 客户端 CheckpointController 也提供本地判断兜底，避免网络包延时与静态标记竞争。
+        if (RewindState.isNativeReloadPending() || CheckpointController.isMultiplayerRollback()) {
             return;
         }
         if (event.getNewScreen() instanceof PauseScreen

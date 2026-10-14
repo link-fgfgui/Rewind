@@ -126,6 +126,7 @@ public final class CheckpointController {
     /** 本轮是否已经把活提交给服务端线程（只在客户端线程读写，避免同一轮反复提交）。 */
     private static boolean workStarted;
     private static volatile boolean workDone;
+    private static volatile boolean multiplayerRollbackSubmitted;
     private static volatile RewindResult workResult;
     private static volatile Throwable workFailure;
 
@@ -173,6 +174,10 @@ public final class CheckpointController {
 
     public static boolean isBusy() {
         return phase != Phase.IDLE;
+    }
+
+    public static boolean isMultiplayerRollback() {
+        return work == Work.MULTIPLAYER_ROLLBACK && phase == Phase.WORKING;
     }
 
     public static Outcome lastOutcome() {
@@ -470,10 +475,16 @@ public final class CheckpointController {
                 }
                 if (!workDone) {
                     // 切片回滚（局域网）：作业由服务端 tick 逐片推进，客户端这边只轮询完成。
-                    if (work == Work.MULTIPLAYER_ROLLBACK && workStarted
-                            && !RewindApi.isMultiplayerRollbackActive()) {
-                        workResult = RewindApi.lastResult();
-                        workDone = true;
+                    if (work == Work.MULTIPLAYER_ROLLBACK && workStarted) {
+                        if (multiplayerRollbackSubmitted && !RewindApi.isMultiplayerRollbackActive()) {
+                            workResult = RewindApi.lastResult();
+                            workDone = true;
+                        } else {
+                            if (phaseTicks % WORK_WARN_INTERVAL_TICKS == 0) {
+                                Rewind.LOGGER.warn("Rewind: {} is taking unusually long ({} ticks)", work, phaseTicks);
+                            }
+                            return;
+                        }
                     } else {
                         // 同步路径上服务端线程还在干活。这里只能等：它正在改世界，任何并发的关世界/重开都会撞上它。
                         // 视觉上的兜底由 RewindTransition 自己的超时守卫负责。
@@ -564,6 +575,7 @@ public final class CheckpointController {
         work = kind;
         workStarted = false;
         workDone = false;
+        multiplayerRollbackSubmitted = false;
         workResult = null;
         workFailure = null;
         phase = Phase.WORKING;
@@ -599,7 +611,13 @@ public final class CheckpointController {
                 workFailure = t;
                 Rewind.LOGGER.error("Rewind: {} threw", work, t);
             } finally {
-                workDone = true;
+                if (work != Work.MULTIPLAYER_ROLLBACK) {
+                    workDone = true;
+                } else if (workFailure != null || workResult == null || !workResult.success) {
+                    workDone = true;
+                } else {
+                    multiplayerRollbackSubmitted = true;
+                }
             }
         });
     }

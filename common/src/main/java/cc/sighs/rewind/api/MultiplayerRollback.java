@@ -186,7 +186,6 @@ final class MultiplayerRollback {
         // 结束事件与索引收尾都必须排在窗口关闭**之后**：afterRollback 的语义统一成「世界已经不再被冻住」。
         RewindState.endDiscard();
         RewindState.endMultiplayerRollback();
-        clearJob();
         RewindResult result;
         if (failure != null || outcome == null) {
             result = RewindApi.fail(RewindResult.Kind.ROLLBACK,
@@ -202,6 +201,9 @@ final class MultiplayerRollback {
         MultiplayerRollback.result = result;
         MultiplayerRollback.request = finished;
         RewindApi.recordResult(result);
+        // 清「正在跑」必须排在结果发布**之后**：客户端以 isActive()==false 作为「结果已经可读」的屏障，
+        // 反过来的话轮询会在这个窗口里读到上一次（或 null）的结果。
+        clearJob();
         if (finished != null) {
             RewindPlatforms.require().afterRollback(finished, result);
         }
@@ -234,12 +236,13 @@ final class MultiplayerRollback {
         RollbackRequest aborted = request;
         RewindState.endDiscard();
         RewindState.endMultiplayerRollback();
-        clearJob();
         RewindResult result = RewindApi.fail(RewindResult.Kind.ROLLBACK,
                 aborted == null ? "" : aborted.slot, failure);
         MultiplayerRollback.result = result;
         MultiplayerRollback.request = aborted;
         RewindApi.recordResult(result);
+        // 同 finish()：结果发布之后才允许客户端看见 isActive()==false。
+        clearJob();
         if (aborted != null) {
             try {
                 RewindPlatforms.require().afterRollback(aborted, result);
